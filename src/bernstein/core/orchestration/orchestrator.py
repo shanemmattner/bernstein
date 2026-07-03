@@ -5399,6 +5399,8 @@ if __name__ == "__main__":
             max_cost_per_agent=seed.max_cost_per_agent if seed else 0.0,
             test_agent=seed.test_agent if seed else TestAgentConfig(),
             cost_autopilot=seed.cost_autopilot if seed else False,
+            judge_model=seed.judge_model if seed else None,
+            judge_provider=seed.judge_provider if seed else None,
         )
 
         if args.cells > 1:
