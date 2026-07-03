@@ -168,6 +168,8 @@ def _select_batch_config(
         templates_dir: Optional path to templates/roles/ for config.yaml lookup.
         metrics_dir: Optional path to .sdd/metrics for bandit state.
         workdir: Optional project root for effectiveness scorer data.
+        default_model: Optional model name from the seed config, used as the
+            primary fallback ahead of the hardcoded Claude tier names.
 
     Returns:
         ModelConfig suitable for the entire batch.
