@@ -133,6 +133,7 @@ def _select_batch_config(
     templates_dir: Path | None = None,
     metrics_dir: Path | None = None,
     workdir: Path | None = None,
+    default_model: str | None = None,
 ) -> ModelConfig:
     """Pick the highest-tier model config across all tasks in a batch.
 
@@ -150,6 +151,8 @@ def _select_batch_config(
         templates_dir: Optional path to templates/roles/ for config.yaml lookup.
         metrics_dir: Optional path to .sdd/metrics for bandit state.
         workdir: Optional project root for effectiveness scorer data.
+        default_model: Optional model name from the seed config, used as the
+            primary fallback ahead of the hardcoded Claude tier names.
 
     Returns:
         ModelConfig suitable for the entire batch.
@@ -177,11 +180,13 @@ def _select_batch_config(
     def _route_for_batch(task: Task) -> ModelConfig:
         """Batch-specific routing: consult bandit when available, else heuristics."""
         if task.model or task.effort:
-            return ModelConfig(model=task.model or "sonnet", effort=task.effort or "normal")
+            return ModelConfig(
+                model=task.model or default_model or "sonnet", effort=task.effort or "normal"
+            )
         if task.role in _HIGH_STAKES_ROLES or task.scope == Scope.LARGE or task.priority == 1:
-            return ModelConfig(model="opus", effort="max")
+            return ModelConfig(model=default_model or "opus", effort="max")
         if task.complexity == Complexity.HIGH:
-            return ModelConfig(model="opus", effort="high")
+            return ModelConfig(model=default_model or "opus", effort="high")
         return route_task(task, bandit_metrics_dir=metrics_dir, workdir=workdir)
 
     configs = [_route_for_batch(t) for t in tasks]

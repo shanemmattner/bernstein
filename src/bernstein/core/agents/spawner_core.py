@@ -2419,6 +2419,7 @@ class AgentSpawner:
             templates_dir=self._templates_dir,
             metrics_dir=metrics_dir if metrics_dir.exists() else None,
             workdir=self._workdir,
+            default_model=self._default_model,
         )
         if model_override:
             base_config = ModelConfig(
@@ -3249,6 +3250,7 @@ class AgentSpawner:
             templates_dir=self._templates_dir,
             metrics_dir=metrics_dir if metrics_dir.exists() else None,
             workdir=self._workdir,
+            default_model=self._default_model,
         )
         role = tasks[0].role
         session_id = f"{role}-resume-{uuid.uuid4().hex[:8]}"
