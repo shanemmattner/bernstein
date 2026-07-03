@@ -3332,7 +3332,13 @@ def _has_llm_judge_signal(task: Task) -> bool:
     return any(signal.type == "llm_judge" for signal in task.completion_signals)
 
 
-def _verify_via_janitor(task: Task, workdir: Path, server_url: str | None) -> tuple[bool, list[str]]:
+def _verify_via_janitor(
+    task: Task,
+    workdir: Path,
+    server_url: str | None,
+    judge_model: str | None = None,
+    judge_provider: str | None = None,
+) -> tuple[bool, list[str]]:
     """Run the async ``run_janitor`` pipeline for a single task synchronously.
 
     Translates a ``JanitorResult`` back into the ``(passed, failed_signals)``
@@ -3345,11 +3351,25 @@ def _verify_via_janitor(task: Task, workdir: Path, server_url: str | None) -> tu
         workdir: Project root for signal evaluation and git diff lookups.
         server_url: Optional task-server URL forwarded to ``run_janitor`` for
             fix-task creation.
+        judge_model: Optional operator-configured model for the janitor's
+            llm_judge signal evaluation (from ``bernstein.yaml``'s
+            ``judge_model``). Falls back to the janitor's hardcoded default
+            when unset.
+        judge_provider: Optional operator-configured provider counterpart
+            to ``judge_model``.
 
     Returns:
         Tuple of (all_passed, list_of_failed_signal_descriptions).
     """
-    results = asyncio.run(run_janitor([task], workdir, server_url=server_url))
+    results = asyncio.run(
+        run_janitor(
+            [task],
+            workdir,
+            server_url=server_url,
+            judge_model=judge_model,
+            judge_provider=judge_provider,
+        )
+    )
     if not results:
         # Task had no completion signals (shouldn't reach here in practice).
         return True, []
@@ -3424,7 +3444,10 @@ def _enqueue_alive_exit_janitor_pass(
         reason,
     )
 
-    server_url: str | None = getattr(getattr(orch, "_config", None), "server_url", None)
+    _orch_config = getattr(orch, "_config", None)
+    server_url: str | None = getattr(_orch_config, "server_url", None)
+    judge_model: str | None = getattr(_orch_config, "judge_model", None)
+    judge_provider: str | None = getattr(_orch_config, "judge_provider", None)
     executor = getattr(orch, "_executor", None)
     if executor is None:
         # Defensive: if the orchestrator has no executor we still want a
@@ -3441,7 +3464,14 @@ def _enqueue_alive_exit_janitor_pass(
             return None
 
     if _has_llm_judge_signal(task):
-        return executor.submit(_verify_via_janitor, task, orch._workdir, server_url)
+        return executor.submit(
+            _verify_via_janitor,
+            task,
+            orch._workdir,
+            server_url,
+            judge_model,
+            judge_provider,
+        )
     return executor.submit(verify_task, task, orch._workdir)
 
 
