@@ -6,6 +6,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, cast
 
+from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
 from bernstein.core.models import ModelConfig, Task
 
 if TYPE_CHECKING:
@@ -77,10 +78,15 @@ def _coerce_model_for_non_claude_adapter(
     model in the manifest that never actually ran. This normalises the selected
     model so the recorded and executed model agree.
 
-    Returns the input unchanged for Claude-compatible adapters (byte-identical),
-    for models that are not Claude tiers, or when no adapter default is known.
-    Callers must only invoke this when the operator did not pin a model
-    (no per-task ``model`` and no ``role_model_policy`` model).
+    Returns the input unchanged for Claude-compatible adapters (byte-identical)
+    or for models that are not Claude tiers. Raises
+    :class:`ModelNotConfiguredError` when the model IS an unpinned Claude tier
+    name being sent to a non-Claude adapter and no adapter default is
+    configured - spawning would otherwise send e.g. ``codex exec -m opus``,
+    which the CLI rejects, or silently bill a Claude-tier-shaped call to a
+    provider that has no such tier. Callers must only invoke this when the
+    operator did not pin a model (no per-task ``model`` and no
+    ``role_model_policy`` model).
     """
     from bernstein.core.bandit_router import BanditRouter
 
@@ -89,7 +95,12 @@ def _coerce_model_for_non_claude_adapter(
     if model_config.model not in _CLAUDE_TIER_MODELS:
         return model_config
     if not adapter_default_model:
-        return model_config
+        raise ModelNotConfiguredError(
+            f"Model '{model_config.model}' is an unpinned Claude tier name but adapter "
+            f"'{adapter_name}' is not Claude-compatible and has no default_model configured. "
+            "Refusing to spawn with a nonsensical model - configure role_model_policy or an "
+            "adapter default.",
+        )
     return ModelConfig(
         model=adapter_default_model,
         effort=model_config.effort,
@@ -120,9 +131,15 @@ def _load_role_config(role: str, templates_dir: Path) -> ModelConfig | None:
         if not isinstance(raw_data, dict):
             return None
         data: dict[str, Any] = cast("dict[str, Any]", raw_data)
-        model = str(data.get("default_model", "sonnet"))
+        model = data.get("default_model")
+        if model is None:
+            logger.debug(
+                "Role config for '%s' has no default_model - skipping role-config routing",
+                role,
+            )
+            return None
         effort = str(data.get("default_effort", "high"))
-        return ModelConfig(model=model, effort=effort)
+        return ModelConfig(model=str(model), effort=effort)
     except Exception as exc:
         logger.warning("Failed to load role config for '%s': %s", role, exc)
         return None
@@ -180,14 +197,33 @@ def _select_batch_config(
     def _route_for_batch(task: Task) -> ModelConfig:
         """Batch-specific routing: consult bandit when available, else heuristics."""
         if task.model or task.effort:
-            return ModelConfig(
-                model=task.model or default_model or "sonnet", effort=task.effort or "normal"
-            )
+            model = task.model or default_model
+            if model is None:
+                raise ModelNotConfiguredError(
+                    f"Task {task.id} has effort={task.effort!r} but no model, and no "
+                    "default_model is configured. Refusing to guess a model.",
+                )
+            return ModelConfig(model=model, effort=task.effort or "normal")
         if task.role in _HIGH_STAKES_ROLES or task.scope == Scope.LARGE or task.priority == 1:
-            return ModelConfig(model=default_model or "opus", effort="max")
+            if default_model is None:
+                raise ModelNotConfiguredError(
+                    f"Task {task.id} (role={task.role}) is high-stakes but no default_model "
+                    "is configured. Refusing to guess a model.",
+                )
+            return ModelConfig(model=default_model, effort="max")
         if task.complexity == Complexity.HIGH:
-            return ModelConfig(model=default_model or "opus", effort="high")
-        return route_task(task, bandit_metrics_dir=metrics_dir, workdir=workdir)
+            if default_model is None:
+                raise ModelNotConfiguredError(
+                    f"Task {task.id} has HIGH complexity but no default_model is configured. "
+                    "Refusing to guess a model.",
+                )
+            return ModelConfig(model=default_model, effort="high")
+        return route_task(
+            task,
+            bandit_metrics_dir=metrics_dir,
+            workdir=workdir,
+            default_model=default_model,
+        )
 
     configs = [_route_for_batch(t) for t in tasks]
     # Sort by model tier (opus > sonnet > haiku) then effort (max > high > normal)
