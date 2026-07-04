@@ -153,6 +153,14 @@ class TaskCreate(BaseModel):
     terminal_reason: str | None = Field(default=None, max_length=_MAX_DESCRIPTION_LEN)
     max_output_tokens: int | None = None  # Per-task output-token cap (escalated on retry)
     meta_messages: list[str] | None = Field(default=None, max_length=_MAX_LIST_LEN)
+    # Explicit override for compute_max_turns()'s complexity-based auto-computation.
+    # When set, callers get exact control over how many turns a Claude agent spawn
+    # gets, bypassing scope/complexity math entirely (see claude_max_turns.py).
+    # Bounded because the value reaches the CLI --max-turns flag verbatim: 0 or a
+    # negative would break the spawn (ge=1 also gives a clean 422 instead of a
+    # confusing CLI-level failure downstream), and an unbounded value defeats
+    # turn budgeting.
+    max_turns: int | None = Field(default=None, ge=1, le=10_000)
 
     @field_validator("scope", "complexity", "task_type")
     @classmethod
