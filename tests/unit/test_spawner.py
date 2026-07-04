@@ -54,7 +54,7 @@ class TestSpawnForTasks:
         adapter = mock_adapter_factory(pid=100)
         templates_dir = tmp_path / "templates" / "roles"
         templates_dir.mkdir(parents=True)
-        spawner = AgentSpawner(adapter, templates_dir, tmp_path, use_worktrees=False)
+        spawner = AgentSpawner(adapter, templates_dir, tmp_path, use_worktrees=False, default_model="mock-model")
 
         task = make_task()
         session = spawner.spawn_for_tasks([task])

@@ -95,6 +95,7 @@ def _make_spawner(tmp_path: Path, adapter: CLIAdapter, bridge: RuntimeBridge) ->
         tmp_path,
         use_worktrees=False,
         runtime_bridge=bridge,
+        default_model="mock-model",
     )
 
 
