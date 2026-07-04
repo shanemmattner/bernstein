@@ -1,0 +1,91 @@
+"""Orchestrator hold/release API.
+
+Lets external callers (dashboards, human-in-the-loop workflows, external
+schedulers) prevent the orchestrator from self-stopping on quiescence
+(``open_tasks == 0 and active_agents == 0``) by acquiring a "hold". See
+``bernstein.core.orchestration.holds`` for the registry implementation and
+``bernstein.core.orchestration.orchestrator`` for where holds are consulted
+before a self-stop decision.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+
+from bernstein.core.orchestration.holds import acquire_hold, list_active_holds, release_hold
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/orchestrator/holds", tags=["orchestrator-holds"])
+
+
+# ---------------------------------------------------------------------------
+# Request / response schemas
+# ---------------------------------------------------------------------------
+
+
+class HoldCreateRequest(BaseModel):
+    """Body for POST /orchestrator/holds."""
+
+    reason: str = Field(..., description="Why the caller wants the orchestrator to stay up")
+    ttl_seconds: float | None = Field(default=None, description="Auto-expiry window; server default if omitted")
+
+
+class HoldResponse(BaseModel):
+    """Serialised hold in API responses."""
+
+    id: str
+    reason: str
+    created_at: float
+    ttl_seconds: float
+    expires_at: float
+
+
+class HoldListResponse(BaseModel):
+    """Response for GET /orchestrator/holds."""
+
+    holds: list[HoldResponse]
+    count: int
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post("", response_model=HoldResponse, responses={200: {"description": "Hold acquired"}})
+def create_hold(body: HoldCreateRequest) -> HoldResponse:
+    """Acquire a new hold, preventing orchestrator self-stop while active."""
+    logger.info("POST /orchestrator/holds: reason=%r ttl_seconds=%r", body.reason, body.ttl_seconds)
+    if body.ttl_seconds is not None:
+        hold = acquire_hold(body.reason, ttl_seconds=body.ttl_seconds)
+    else:
+        hold = acquire_hold(body.reason)
+    return HoldResponse(**hold.to_dict())  # type: ignore[arg-type]
+
+
+@router.delete(
+    "/{hold_id}",
+    responses={404: {"description": "Hold not found (already released or expired)"}},
+)
+def delete_hold(hold_id: str) -> dict[str, bool]:
+    """Release a hold by id."""
+    logger.info("DELETE /orchestrator/holds/%s", hold_id)
+    released = release_hold(hold_id)
+    if not released:
+        raise HTTPException(status_code=404, detail=f"Hold {hold_id} not found")
+    return {"released": True}
+
+
+@router.get("", response_model=HoldListResponse)
+def get_holds() -> HoldListResponse:
+    """List all currently active (non-expired) holds."""
+    holds = list_active_holds()
+    logger.info("GET /orchestrator/holds: %d active", len(holds))
+    return HoldListResponse(
+        holds=[HoldResponse(**h.to_dict()) for h in holds],  # type: ignore[arg-type]
+        count=len(holds),
+    )

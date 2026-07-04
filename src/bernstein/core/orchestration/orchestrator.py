@@ -99,6 +99,7 @@ from bernstein.core.orchestration.tick_pipeline import (
     block_task,
     complete_task,
     fail_task,
+    fetch_active_holds,
     fetch_all_tasks,
     group_by_role,
     parse_backlog_file,
@@ -1938,16 +1939,45 @@ class Orchestrator:
                     settled_open = len(settled["open"])
                     settled_agents = sum(1 for a in self._agents.values() if a.status != "dead")
                     if settled_open == settled_agents == 0:
-                        logger.info(
-                            "Quiescence confirmed after %.1fs settle window (tick #%d, "
-                            "open=%d agents=%d) - self-stopping",
-                            _settle_s,
-                            self._tick_count,
-                            settled_open,
-                            settled_agents,
-                        )
-                        self._regenerate_final_retrospective(trigger_path="tick-quiescence-self-stop")
-                        self._running = False
+                        # Hold/release API (supplements the settle-timer
+                        # self-stop above): external callers can call
+                        # POST /orchestrator/holds to keep this orchestrator
+                        # alive even when it looks fully quiescent - e.g. a
+                        # dashboard mid-review, or an external scheduler about
+                        # to enqueue follow-up tasks that hasn't posted them
+                        # yet. Checked here, right before the actual
+                        # self-stop, so a hold acquired at any point up to
+                        # this instant still prevents the stop for this tick.
+                        try:
+                            _active_holds = fetch_active_holds(self._client, base)
+                        except Exception as exc:  # noqa: BLE001 - defensive, must never crash the tick loop
+                            logger.warning(
+                                "fetch_active_holds raised during quiescence self-stop check (tick #%d): %s "
+                                "- treating as no active holds",
+                                self._tick_count,
+                                exc,
+                            )
+                            _active_holds = []
+                        if _active_holds:
+                            _hold_reasons = [str(h.get("reason", "<no reason>")) for h in _active_holds]
+                            logger.info(
+                                "Quiescence detected but %d active hold(s) present (tick #%d) - skipping "
+                                "self-stop: %s",
+                                len(_active_holds),
+                                self._tick_count,
+                                _hold_reasons,
+                            )
+                        else:
+                            logger.info(
+                                "Quiescence confirmed after %.1fs settle window (tick #%d, "
+                                "open=%d agents=%d, no active holds) - self-stopping",
+                                _settle_s,
+                                self._tick_count,
+                                settled_open,
+                                settled_agents,
+                            )
+                            self._regenerate_final_retrospective(trigger_path="tick-quiescence-self-stop")
+                            self._running = False
                     else:
                         logger.info(
                             "Quiescence NOT confirmed after %.1fs settle window (tick #%d): "
