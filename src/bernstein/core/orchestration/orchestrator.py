@@ -500,7 +500,7 @@ class Orchestrator:
         # cap (set by ``bernstein run --hard-budget``). Attach a rolling
         # JSONL ledger so per-call attribution lands in
         # ``.sdd/cost/ledger.jsonl``.
-        run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        run_id = os.environ.get("BERNSTEIN_RUN_ID") or datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         self._run_id = run_id
         # Wave 3 (per-agent instrumentation): export the run id onto the
         # process environment so it threads through
