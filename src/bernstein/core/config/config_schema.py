@@ -159,7 +159,7 @@ class CouncilCandidateConfig(BaseModel):
 
 
 class CouncilConfig(BaseModel):
-    """"Council of agents" fan-out/judge configuration for one role.
+    """ "Council of agents" fan-out/judge configuration for one role.
 
     When set on a :class:`RoleModelPolicyEntry` (or loaded from a
     ``role_model_policy.<role>.model: "*.yaml"`` council definition file -

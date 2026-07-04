@@ -47,7 +47,6 @@ from bernstein.core.seed import (
     SeedConfig,
     github_backlog_sync_enabled,
     parse_seed,
-    resolve_seed_path,
 )
 from bernstein.core.server_launch import (
     BootstrapResult,
@@ -1196,7 +1195,8 @@ def _bootstrap_from_goal_impl(
     if model:
         low, high = estimate_run_cost(est_task_count, model)
         console.print(
-            f"[bold yellow]Cost estimate:[/bold yellow] ${low:.2f}-${high:.2f} ({est_task_count} task(s), {model} model)"
+            f"[bold yellow]Cost estimate:[/bold yellow] ${low:.2f}-${high:.2f} "
+            f"({est_task_count} task(s), {model} model)"
         )
     else:
         console.print(

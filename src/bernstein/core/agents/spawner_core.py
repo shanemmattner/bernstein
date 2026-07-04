@@ -2449,8 +2449,7 @@ class AgentSpawner:
                 # than silently falling through to code-level defaults.
                 role_policy_match = "HARD FAIL"
                 logger.info(
-                    "role_model_policy resolution for role=%r: match=%s, resolved=None, "
-                    "available_keys=%s",
+                    "role_model_policy resolution for role=%r: match=%s, resolved=None, available_keys=%s",
                     role_name,
                     role_policy_match,
                     sorted(self._role_model_policy.keys()),
@@ -2468,8 +2467,7 @@ class AgentSpawner:
             role_policy = {}
             role_policy_match = "none"
         logger.info(
-            "role_model_policy resolution for role=%r: match=%s, resolved=%s, "
-            "available_keys=%s",
+            "role_model_policy resolution for role=%r: match=%s, resolved=%s, available_keys=%s",
             role_name,
             role_policy_match,
             role_policy,

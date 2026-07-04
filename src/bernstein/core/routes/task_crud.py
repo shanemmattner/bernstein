@@ -780,8 +780,7 @@ async def create_task(body: TaskCreate, request: Request) -> TaskResponse:
             valid_roles = [k for k in policy_keys if k != "default"]
             if raw_role != "auto" and raw_role not in role_model_policy:
                 logger.warning(
-                    "Rejecting task create: title=%r attempted role=%r is not a valid "
-                    "role. Valid roles=%s",
+                    "Rejecting task create: title=%r attempted role=%r is not a valid role. Valid roles=%s",
                     effective_body.title,
                     raw_role,
                     valid_roles,

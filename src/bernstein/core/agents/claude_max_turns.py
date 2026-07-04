@@ -126,7 +126,9 @@ def compute_max_turns(
             timeout_s=timeout_s,
             turns_per_minute=_TURNS_PER_MINUTE.get(_classify_model_tier(model), DEFAULT_TURNS_PER_MINUTE),
             constrained_by_timeout=False,
-            reasoning=f"Explicit max_turns={explicit_max_turns} supplied by caller; complexity-based computation bypassed.",
+            reasoning=(
+                f"Explicit max_turns={explicit_max_turns} supplied by caller; complexity-based computation bypassed."
+            ),
         )
 
     base = _BASE_TURNS.get(complexity, _BASE_TURNS["medium"])

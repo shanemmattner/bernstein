@@ -59,14 +59,11 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import yaml
 
 from bernstein.core.instrumentation import get_instrumenter, init_instrumenter, resolve_agent_dir
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +145,7 @@ def _log_result_conversation_messages(result: Any) -> None:
     """
     try:
         new_items = getattr(result, "new_items", None) or []
-    except Exception as exc:  # noqa: BLE001 - defensive, see docstring
+    except Exception as exc:
         logger.warning("_log_result_conversation_messages: failed to read new_items: %s", exc)
         return
 
@@ -167,7 +164,7 @@ def _log_result_conversation_messages(result: Any) -> None:
                 content_length=content_length,
                 tool_calls=[str(tool_name)] if tool_name else None,
             )
-        except Exception as exc:  # noqa: BLE001 - one malformed item must not drop the rest
+        except Exception as exc:
             logger.warning("_log_result_conversation_messages: skipped one item (%s): %s", type(item).__name__, exc)
 
     try:
@@ -178,7 +175,7 @@ def _log_result_conversation_messages(result: Any) -> None:
                 role="assistant",
                 content_length=len(str(final_output)),
             )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("_log_result_conversation_messages: failed to log final_output: %s", exc)
 
 
@@ -259,7 +256,7 @@ def _instrument_event(event: Mapping[str, Any]) -> None:
                 error=str(event.get("error")) if event.get("error") else None,
             )
             return
-    except Exception as exc:  # noqa: BLE001 - instrumentation must never break the real event stream
+    except Exception as exc:
         logger.warning("_instrument_event failed for event type=%r: %s", event.get("type"), exc)
 
 
@@ -268,6 +265,7 @@ def _now_iso_for_instrumentation() -> str:
     import datetime as _dt
 
     return _dt.datetime.now(_dt.UTC).isoformat(timespec="milliseconds")
+
 
 # Exit codes are part of the public contract with the adapter - keep in sync
 # with the module docstring above.
@@ -959,8 +957,7 @@ def _load_council_config(manifest: RunnerManifest) -> dict[str, Any] | None:
         raise RuntimeError(msg)
 
     logger.info(
-        "openai_agents_runner session=%s: council file %s parsed OK: %d candidates, "
-        "judge model=%r, timeout=%r",
+        "openai_agents_runner session=%s: council file %s parsed OK: %d candidates, judge model=%r, timeout=%r",
         manifest.session_id,
         config_path,
         len(raw_candidates),

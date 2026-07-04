@@ -710,9 +710,7 @@ def _parse_council_candidate(role: str, member: str, raw: object) -> dict[str, s
 
     unknown_keys = sorted(set(raw) - set(_COUNCIL_CANDIDATE_KEYS))
     if unknown_keys:
-        raise SeedError(
-            f"role_model_policy[{role!r}].council.{member} has unknown keys: {', '.join(unknown_keys)}"
-        )
+        raise SeedError(f"role_model_policy[{role!r}].council.{member} has unknown keys: {', '.join(unknown_keys)}")
     return parsed
 
 
@@ -741,9 +739,7 @@ def _parse_council(role: str, raw: object) -> dict[str, object]:
     raw_candidates = raw.get("candidates")
     if not isinstance(raw_candidates, list) or not raw_candidates:
         raise SeedError(f"role_model_policy[{role!r}].council.candidates must be a non-empty list")
-    candidates = [
-        _parse_council_candidate(role, f"candidates[{i}]", entry) for i, entry in enumerate(raw_candidates)
-    ]
+    candidates = [_parse_council_candidate(role, f"candidates[{i}]", entry) for i, entry in enumerate(raw_candidates)]
 
     raw_judge = raw.get("judge")
     if raw_judge is None:

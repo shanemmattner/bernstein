@@ -282,8 +282,10 @@ def fetch_active_holds(client: httpx.Client, base_url: str) -> list[dict[str, An
         holds = cast("list[dict[str, Any]]", body.get("holds", []))
         logger.debug("fetch_active_holds: %d active hold(s)", len(holds))
         return holds
-    except Exception as exc:  # noqa: BLE001 - defensive, must never block the tick loop
-        logger.warning("fetch_active_holds: failed to fetch holds from %s (%s) - treating as no active holds", base_url, exc)
+    except Exception as exc:
+        logger.warning(
+            "fetch_active_holds: failed to fetch holds from %s (%s) - treating as no active holds", base_url, exc
+        )
         return []
 
 

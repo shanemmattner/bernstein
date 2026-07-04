@@ -22,7 +22,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 # Re-export all dataclasses / config types from seed_config
-from bernstein.core.config.seed_config import (  # noqa: F401
+from bernstein.core.config.seed_config import (  # noqa: F401, E402
     CORSConfig,
     DashboardAuthConfig,
     GithubConfig,
@@ -41,7 +41,14 @@ from bernstein.core.config.seed_config import (  # noqa: F401
 )
 
 # Re-export all parsing functions from seed_parser
-from bernstein.core.config.seed_parser import (  # noqa: F401
+# Re-export regex/frozenset constants that callers may reference
+from bernstein.core.config.seed_parser import (  # noqa: F401, E402
+    _ALLOWED_WEBHOOK_EVENTS,
+    _BUDGET_RE,
+    _DEFAULT_RATE_LIMIT_PATHS,
+    _ENV_REF_RE,
+    _VALID_CLIS,
+    _WEBHOOK_EVENT_ALIASES,
     _expand_env_value,
     _normalize_webhook_event,
     _parse_bridge_settings,
@@ -62,21 +69,11 @@ from bernstein.core.config.seed_parser import (  # noqa: F401
     _parse_tenants,
     parse_seed,
 )
-from bernstein.core.models import (
+from bernstein.core.models import (  # noqa: E402
     Complexity,
     Scope,
     Task,
     TaskStatus,
-)
-
-# Re-export regex/frozenset constants that callers may reference
-from bernstein.core.config.seed_parser import (  # noqa: F401
-    _ALLOWED_WEBHOOK_EVENTS,
-    _BUDGET_RE,
-    _DEFAULT_RATE_LIMIT_PATHS,
-    _ENV_REF_RE,
-    _VALID_CLIS,
-    _WEBHOOK_EVENT_ALIASES,
 )
 
 # Type alias kept for backward compatibility

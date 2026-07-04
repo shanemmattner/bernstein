@@ -130,11 +130,7 @@ def ensure_sdd(workdir: Path, *, model: str | None = None) -> bool:
                 workdir,
             )
         config_path.write_text(
-            "# Bernstein workspace config\n"
-            "server_port: 8052\n"
-            "max_workers: 4\n"
-            f"{model_line}"
-            "default_effort: max\n"
+            f"# Bernstein workspace config\nserver_port: 8052\nmax_workers: 4\n{model_line}default_effort: max\n"
         )
 
     # .gitignore for runtime dir - ensure session.json is always listed.

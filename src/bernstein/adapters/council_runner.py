@@ -202,8 +202,7 @@ async def _run_candidate(
 
     run_kwargs: dict[str, Any] = {} if max_turns is None else {"max_turns": max_turns}
     logger.info(
-        "run_council._run_candidate: dispatching %s base_url=%r (api_key_env=%r) "
-        "timeout=%.1fs max_turns=%s",
+        "run_council._run_candidate: dispatching %s base_url=%r (api_key_env=%r) timeout=%.1fs max_turns=%s",
         label,
         member.get("base_url") or "<default>",
         member.get("api_key_env") or "<ambient OPENAI_API_KEY>",
@@ -224,7 +223,7 @@ async def _run_candidate(
             timeout,
         )
         return None
-    except Exception as exc:  # noqa: BLE001 - one bad candidate must never kill the council
+    except Exception as exc:
         logger.warning(
             "run_council._run_candidate: %s FAILED after %.2fs: %s: %s - excluding it "
             "from judge synthesis, continuing with remaining candidates",
@@ -389,10 +388,7 @@ async def _run_council_async(
     # itself catches everything and returns ``None`` for a dead candidate
     # instead of letting the exception escape to ``gather``.
     candidate_results = await asyncio.gather(
-        *(
-            _run_candidate(i, member, agent, prompt, timeout, max_turns)
-            for i, member in enumerate(raw_candidates)
-        ),
+        *(_run_candidate(i, member, agent, prompt, timeout, max_turns) for i, member in enumerate(raw_candidates)),
     )
 
     live: list[tuple[str, str, Any]] = [r for r in candidate_results if r is not None]
@@ -414,9 +410,7 @@ async def _run_council_async(
         [label for label, _, _ in live],
     )
 
-    candidate_outputs = [
-        (label, str(getattr(result, "final_output", ""))) for label, _model_id, result in live
-    ]
+    candidate_outputs = [(label, str(getattr(result, "final_output", ""))) for label, _model_id, result in live]
     judge_result = await _run_judge(judge_member, prompt, candidate_outputs, timeout, agent, max_turns)
 
     # Aggregate cost accounting (back-compat fallback only - see

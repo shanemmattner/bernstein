@@ -231,7 +231,7 @@ class RunInstrumenter:
             if tokens_per_sec is not None:
                 record["tokens_per_sec"] = tokens_per_sec
             self._append_line(self._llm_calls_path(), record, kind="llm_call", key=call_id)
-        except Exception as exc:  # noqa: BLE001 - instrumentation must never raise
+        except Exception as exc:
             logger.warning("RunInstrumenter.log_llm_call failed for call_id=%s: %s", call_id, exc)
 
     def log_tool_call(
@@ -266,7 +266,7 @@ class RunInstrumenter:
                 "error": error,
             }
             self._append_line(self._tool_calls_path(), record, kind="tool_call", key=call_id)
-        except Exception as exc:  # noqa: BLE001 - instrumentation must never raise
+        except Exception as exc:
             logger.warning("RunInstrumenter.log_tool_call failed for call_id=%s: %s", call_id, exc)
 
     def log_message(
@@ -293,7 +293,7 @@ class RunInstrumenter:
             if tool_calls:
                 record["tool_calls"] = list(tool_calls)
             self._append_line(self._conversation_path(), record, kind="message", key=str(idx))
-        except Exception as exc:  # noqa: BLE001 - instrumentation must never raise
+        except Exception as exc:
             logger.warning("RunInstrumenter.log_message failed for idx=%s: %s", idx, exc)
 
 
@@ -320,7 +320,7 @@ class _NullInstrumenter(RunInstrumenter):
     instrumenter is explicitly initialized via :func:`init_instrumenter`.
     """
 
-    def __init__(self) -> None:  # noqa: super-init-not-called - intentionally skips dir creation
+    def __init__(self) -> None:  # intentionally skips dir creation, no base __init__ to call
         self.run_id = "uninitialized"
         self.task_id = "uninitialized"
         self.agent_id = "uninitialized"
