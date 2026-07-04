@@ -498,6 +498,17 @@ class RunnerManifest:
     # hand-written manifest for a direct invocation/test) - the runner then
     # instruments under a literal "unknown" task bucket rather than failing.
     task_id: str | None = None
+    # Wave 3 (per-agent instrumentation): orchestrator-root directory,
+    # injected by ``spawner_core`` (mirrors ``heartbeat_dir`` above - same
+    # reasoning: ``workdir`` is a per-session worktree under default
+    # isolation, deleted on cleanup/merge, so instrumentation JSONL must be
+    # anchored to the project root the orchestrator itself uses for
+    # ``.sdd/runs/<run_id>/summary.json`` - see
+    # :func:`bernstein.core.orchestration.run_report.write_summary_json`).
+    # ``None`` when absent (e.g. a hand-written manifest for a direct
+    # invocation/test) - the runner then falls back to ``workdir``, which is
+    # also correct for those callers since there is no separate worktree.
+    instrumentation_root: str | None = None
     # Control knobs resolved by the SPAWN side. They must travel in the
     # manifest because the spawner hands the runner a filtered environment
     # (env_isolation) that strips BERNSTEIN_* control vars - parent-env
@@ -1399,8 +1410,24 @@ def run(manifest: RunnerManifest) -> int:
     _reset_instrumentation_counters()
     run_id = os.environ.get("BERNSTEIN_RUN_ID", "unknown")
     task_id = manifest.task_id or "unknown"
-    agent_dir = resolve_agent_dir(Path(manifest.workdir), run_id, task_id, manifest.session_id)
+    # Prefer ``instrumentation_root`` (the orchestrator's project root,
+    # injected by spawner_core) over ``manifest.workdir``. Under default
+    # worktree isolation ``workdir`` is a per-session worktree that gets
+    # deleted on cleanup/merge - instrumentation written there would either
+    # never be found (wave-2's summary.json lives at the project root) or
+    # vanish entirely once the worktree is torn down. Hand-written
+    # manifests (tests, direct invocation) have no worktree at all, so
+    # falling back to ``workdir`` there is correct.
+    instrumentation_base = manifest.instrumentation_root or manifest.workdir
+    agent_dir = resolve_agent_dir(Path(instrumentation_base), run_id, task_id, manifest.session_id)
     init_instrumenter(run_id=run_id, task_id=task_id, agent_id=manifest.session_id, base_dir=agent_dir)
+    logger.info(
+        "Instrumentation base dir resolved: instrumentation_root=%r workdir=%r -> using %r -> agent_dir=%s",
+        manifest.instrumentation_root,
+        manifest.workdir,
+        instrumentation_base,
+        agent_dir,
+    )
 
     # Every effective sampling/endpoint param is logged here.  The key
     # itself is never logged - only the NAME of the env var that holds it.
@@ -1898,6 +1925,19 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
         )
         if type(exc).__name__ == "MaxTurnsExceeded":
             _log_max_turns_exceeded(exc, max_turns)
+        # Logging-gap fix: conversation.jsonl was previously only ever
+        # written on the success path (see the call to
+        # ``_log_result_conversation_messages`` after ``run_sync`` returns
+        # below). Any run that raises - MaxTurnsExceeded, a rate limit, a
+        # malformed SDK response - skipped straight to the ``except`` block
+        # and never logged a single conversation message, even though
+        # ``exc.run_data`` (``RunErrorDetails``) carries the same
+        # ``new_items``/``final_output`` shape a successful ``RunResult``
+        # does (this is exactly the object ``_emit_session_usage`` above
+        # already reads for usage/pricing on the failure path). Mirror that
+        # partial state into conversation.jsonl too so a failed run leaves
+        # a full transcript of what happened before it died, not silence.
+        _log_result_conversation_messages(getattr(exc, "run_data", None))
         if _is_rate_limit(exc):
             emit_event(
                 {

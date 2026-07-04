@@ -1868,6 +1868,22 @@ class AgentSpawner:
         the ``HeartbeatMonitor`` polls - without this injection the
         heartbeat would land in the worktree and never be observed.
 
+        The SAME attribute gates injection of ``instrumentation_root``:
+        the orchestrator's wave-2 phase/task timing (``write_summary_json``)
+        lives under ``self._workdir / ".sdd" / "runs" / <run_id>`` (the
+        project root), but the runner subprocess only knows its own
+        per-session worktree path (``manifest.workdir``) under default
+        worktree isolation (``use_worktrees=True``). Without this
+        injection ``RunInstrumenter`` writes its llm-calls/tool-calls/
+        conversation JSONL under ``<worktree>/.sdd/runs/...`` instead -
+        a directory that (a) nobody looks in, since the run report lives
+        at the project root, and (b) is deleted outright when the
+        worktree is merged/cleaned up after the task finishes, so the
+        JSONL files vanish even on a fully successful run. This exactly
+        mirrors the pre-existing ``heartbeat_dir`` bug this docstring
+        describes above, just for wave-3 instrumentation instead of
+        wave-2 heartbeats.
+
         Adapters without the attribute get ``mcp_config`` back unchanged
         so their MCP config files stay byte-identical.
 
@@ -1882,15 +1898,21 @@ class AgentSpawner:
         injected = bool(consumes)
         if injected:
             heartbeat_dir = str(self._workdir / ".sdd" / "runtime" / "heartbeats")
+            instrumentation_root = str(self._workdir)
         logger.info(
-            "heartbeat_dir injection check: adapter=%s consumes_heartbeat_dir=%s injected=%s",
+            "heartbeat_dir/instrumentation_root injection check: adapter=%s "
+            "consumes_heartbeat_dir=%s injected=%s",
             adapter.name() if hasattr(adapter, "name") else type(adapter).__name__,
             consumes,
             injected,
         )
         if not injected:
             return mcp_config
-        return {**(mcp_config or {}), "heartbeat_dir": heartbeat_dir}
+        return {
+            **(mcp_config or {}),
+            "heartbeat_dir": heartbeat_dir,
+            "instrumentation_root": instrumentation_root,
+        }
 
     def _primary_adapter_supports_sampling(
         self, model_config: ModelConfig, *, provider_name: str | None = None
