@@ -91,14 +91,42 @@ _pending_tool_calls: dict[str, list[dict[str, Any]]] = {}
 # ``_log_result_conversation_messages``).
 _conversation_idx_counter = itertools.count(0)
 
+# Wave 4 (per-turn instrumentation, fixing the "only one aggregate llm-call
+# entry per agent" bug): count of llm-calls.jsonl entries written by the
+# SDK RunHooks-driven on_llm_end hook (see _build_instrumentation_hooks)
+# during the CURRENT run() invocation. When this is > 0 at the end of the
+# session, two pre-existing "single aggregate entry" code paths are
+# deliberately SKIPPED so a run doesn't get N precise per-turn entries PLUS
+# a duplicate aggregate/post-hoc one: (1) the "usage" branch of
+# _instrument_event no longer mirrors an llm-call entry, and (2) the
+# post-hoc _log_result_conversation_messages() call is skipped in favor of
+# the real-time per-turn conversation logging the hook already did (see
+# _log_hook_turn_conversation). Reset per run() via
+# _reset_instrumentation_counters so a fresh invocation (e.g. a test
+# calling run() twice) starts clean.
+_hook_llm_calls_logged: int = 0
+
 
 def _reset_instrumentation_counters() -> None:
     """Reset per-process instrumentation counters/state (test/re-run hygiene)."""
-    global _llm_call_counter, _tool_call_counter, _conversation_idx_counter
+    global _llm_call_counter, _tool_call_counter, _conversation_idx_counter, _hook_llm_calls_logged
     _llm_call_counter = itertools.count(1)
     _tool_call_counter = itertools.count(1)
     _conversation_idx_counter = itertools.count(0)
+    _hook_llm_calls_logged = 0
     _pending_tool_calls.clear()
+
+
+def _mark_hook_llm_call_logged() -> None:
+    """Record that the per-turn RunHooks path wrote one llm-calls.jsonl entry.
+
+    Called exactly once per successful (or hook-detected-failed) turn from
+    inside the dynamically-built ``RunHooks`` subclass in
+    :func:`_build_instrumentation_hooks`. See :data:`_hook_llm_calls_logged`
+    docstring for why downstream aggregate-logging paths check this.
+    """
+    global _hook_llm_calls_logged
+    _hook_llm_calls_logged += 1
 
 
 def _log_initial_conversation_messages(manifest: RunnerManifest) -> None:
@@ -189,6 +217,296 @@ def _infer_role_from_item_type(item_type: str) -> str:
     return "unknown"
 
 
+def _log_hook_turn_conversation(response: Any) -> None:
+    """Log one conversation.jsonl entry per output item generated THIS turn.
+
+    Called from the per-turn ``on_llm_end`` hook (see
+    :func:`_build_instrumentation_hooks`) with the SDK's ``ModelResponse``
+    for that single LLM call. Unlike :func:`_log_result_conversation_messages`
+    (the old best-effort path - still used as a fallback for runs where the
+    hooks path never engaged, e.g. a task-level council run, see the
+    ``_hook_llm_calls_logged`` guards in :func:`_run_session`), this fires
+    in REAL TIME as each turn completes rather than once, after-the-fact,
+    for the whole session - fixing the "conversation.jsonl only shows a
+    final summary" half of this wave's bug report.
+
+    Wrapped defensively exactly like its post-hoc sibling: a malformed or
+    unexpected ``response.output`` item shape must never crash the agent
+    run being observed.
+    """
+    instrumenter = get_instrumenter()
+    try:
+        output_items = getattr(response, "output", None) or []
+    except Exception as exc:
+        logger.warning("_log_hook_turn_conversation: failed to read response.output: %s", exc)
+        return
+
+    for item in output_items:
+        try:
+            item_type = type(item).__name__
+            role = str(getattr(item, "role", None) or _infer_role_from_item_type(item_type))
+            content = getattr(item, "content", None)
+            tool_name = getattr(item, "name", None)
+            content_length = len(str(content)) if content is not None else len(str(item))
+            instrumenter.log_message(
+                idx=next(_conversation_idx_counter),
+                role=role,
+                content_length=content_length,
+                tool_calls=[str(tool_name)] if tool_name else None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "_log_hook_turn_conversation: skipped one item (%s): %s",
+                type(item).__name__,
+                exc,
+            )
+
+
+def _model_name_for_hooks(agent: Any, manifest: RunnerManifest) -> str:
+    """Best-effort real model id for a per-turn hook's llm-calls.jsonl entry.
+
+    ``agent.model`` is either a plain string (the common case) or an SDK
+    ``Model`` instance - e.g. ``OpenAIChatCompletionsModel``, built by the
+    ``explicit_model_client`` branch in :func:`_run_session` for
+    ``base_url``-overridden endpoints - which itself exposes the underlying
+    model id as its OWN ``.model`` attribute (confirmed via on-disk
+    inspection of ``agents/models/openai_chatcompletions.py``:
+    ``self.model = model`` in ``__init__``). Falls back to
+    ``manifest.model`` and never raises, so a model-name lookup can never
+    crash the run a hook is observing.
+    """
+    try:
+        model_attr = getattr(agent, "model", None)
+        if isinstance(model_attr, str) and model_attr:
+            return model_attr
+        if model_attr is not None:
+            inner = getattr(model_attr, "model", None)
+            if isinstance(inner, str) and inner:
+                return inner
+    except Exception as exc:
+        logger.warning(
+            "_model_name_for_hooks: failed to resolve model name for session=%s, "
+            "falling back to manifest.model=%r: %s",
+            manifest.session_id,
+            manifest.model,
+            exc,
+        )
+    return manifest.model
+
+
+def _build_instrumentation_hooks(sdk: Any, manifest: RunnerManifest) -> Any:
+    """Build a per-run ``RunHooks`` instance wired to the ``RunInstrumenter``.
+
+    This is the wave-4 fix for "only one aggregate llm-call entry gets
+    logged per agent instead of one entry per actual per-turn LLM call".
+    On-disk inspection of the installed SDK (openai-agents 0.17.7,
+    ``agents/lifecycle.py``) shows ``RunHooksBase`` exposes
+    ``on_llm_start``/``on_llm_end`` firing once PER MODEL CALL (turn) with
+    that turn's ``ModelResponse`` (usage, output items), and
+    ``on_tool_start``/``on_tool_end`` firing once PER TOOL CALL with a
+    ``ToolContext`` carrying ``tool_call_id``/``tool_name``/
+    ``tool_arguments`` - exactly the granularity llm-calls.jsonl and
+    tool-calls.jsonl are supposed to have. ``Runner.run_sync`` already
+    accepts a ``hooks: RunHooks[TContext] | None`` kwarg (see its signature
+    in ``agents/run.py``) that the SDK threads straight through its
+    internal turn loop, so no switch to ``Runner.run_streamed()`` is
+    needed - wiring ``hooks=`` into the existing ``run_sync_kwargs`` in
+    :func:`_run_session` is sufficient.
+
+    Tool-call hook logging is deliberately SKIPPED when
+    ``manifest.tool_source == "builtin"``:
+    :mod:`bernstein.adapters.openai_agents_builtins` already emits its own
+    ``tool_call``/``tool_result`` stdout events for the four
+    workdir-sandboxed builtins, which :func:`_instrument_event` already
+    mirrors into tool-calls.jsonl via the ``_pending_tool_calls`` FIFO.
+    Wiring the hook unconditionally would double-log every builtin tool
+    call (once from the builtin's own emit_event, once from the hook).
+    Gateway-sourced tools (``tool_source == "gateway"``, the default) have
+    NO other tool-call logging path today, so the hook is the ONLY source
+    of tool-calls.jsonl coverage for them.
+
+    Args:
+        sdk: The imported ``agents`` module (already cast to ``Any`` by the
+            caller in :func:`_run_session`).
+        manifest: The parsed runner manifest for this session.
+
+    Returns:
+        An instance of a dynamically-created ``sdk.RunHooks`` subclass.
+        Built dynamically (not a module-level class) because ``sdk.RunHooks``
+        - a generic alias over the lazily-imported SDK's own base class -
+        only exists once the optional SDK has actually been imported.
+    """
+    instrumenter = get_instrumenter()
+    log_tool_hooks = manifest.tool_source != "builtin"
+    logger.debug(
+        "hook registration: building instrumentation RunHooks for session=%s "
+        "tool_source=%r (tool-call hook logging %s)",
+        manifest.session_id,
+        manifest.tool_source,
+        "enabled" if log_tool_hooks else "disabled - builtin tools log via their own emit_event path",
+    )
+
+    class _InstrumentationHooks(sdk.RunHooks):  # type: ignore[misc,valid-type]
+        """Dynamically-built RunHooks subclass - see enclosing factory docstring."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._llm_call_id: str | None = None
+            self._llm_ts_start: str | None = None
+            self._pending_tools: dict[str, dict[str, Any]] = {}
+
+        async def on_llm_start(
+            self,
+            context: Any,
+            agent: Any,
+            system_prompt: Any,
+            input_items: Any,
+        ) -> None:
+            try:
+                call_id = f"c-{next(_llm_call_counter)}"
+                self._llm_call_id = call_id
+                self._llm_ts_start = _now_iso_for_instrumentation()
+                logger.debug(
+                    "hook fired: on_llm_start call_id=%s session=%s model=%s input_items=%d",
+                    call_id,
+                    manifest.session_id,
+                    _model_name_for_hooks(agent, manifest),
+                    len(input_items) if input_items is not None else 0,
+                )
+            except Exception as exc:
+                logger.warning("on_llm_start hook failed for session=%s: %s", manifest.session_id, exc)
+
+        async def on_llm_end(self, context: Any, agent: Any, response: Any) -> None:
+            ts_end = _now_iso_for_instrumentation()
+            call_id = self._llm_call_id or f"c-{next(_llm_call_counter)}"
+            ts_start = self._llm_ts_start or ts_end
+            self._llm_call_id = None
+            self._llm_ts_start = None
+            try:
+                model_name = _model_name_for_hooks(agent, manifest)
+                usage = getattr(response, "usage", None)
+                prompt_tokens = int(getattr(usage, "input_tokens", 0) or 0) if usage is not None else None
+                completion_tokens = int(getattr(usage, "output_tokens", 0) or 0) if usage is not None else None
+                total_tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else None
+                instrumenter.log_llm_call(
+                    call_id=call_id,
+                    ts_start=ts_start,
+                    ts_end=ts_end,
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    status="ok",
+                )
+                _mark_hook_llm_call_logged()
+                logger.debug(
+                    "wrote llm_call entry call_id=%s session=%s model=%s prompt_tokens=%s "
+                    "completion_tokens=%s total_tokens=%s",
+                    call_id,
+                    manifest.session_id,
+                    model_name,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                )
+                _log_hook_turn_conversation(response)
+            except Exception as exc:
+                logger.warning(
+                    "on_llm_end hook failed for session=%s call_id=%s: %s - logging a "
+                    "status=error placeholder entry so this turn is not silently missing "
+                    "from llm-calls.jsonl",
+                    manifest.session_id,
+                    call_id,
+                    exc,
+                )
+                try:
+                    instrumenter.log_llm_call(
+                        call_id=call_id,
+                        ts_start=ts_start,
+                        ts_end=ts_end,
+                        model=manifest.model,
+                        status="error",
+                        error=f"on_llm_end hook failed: {type(exc).__name__}: {exc}",
+                    )
+                    _mark_hook_llm_call_logged()
+                except Exception as inner_exc:
+                    logger.warning(
+                        "on_llm_end hook: even the status=error fallback log_llm_call "
+                        "failed for session=%s call_id=%s: %s",
+                        manifest.session_id,
+                        call_id,
+                        inner_exc,
+                    )
+
+        async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+            if not log_tool_hooks:
+                return
+            try:
+                tool_name = str(getattr(tool, "name", "unknown"))
+                tool_call_id = str(getattr(context, "tool_call_id", None) or f"unkeyed-{next(_tool_call_counter)}")
+                call_id = f"tc-{next(_tool_call_counter)}"
+                raw_args = getattr(context, "tool_arguments", None)
+                args_dict: dict[str, Any]
+                if isinstance(raw_args, str):
+                    try:
+                        parsed_args = json.loads(raw_args)
+                        args_dict = parsed_args if isinstance(parsed_args, dict) else {"args": parsed_args}
+                    except (json.JSONDecodeError, TypeError):
+                        args_dict = {"raw_args": raw_args}
+                elif isinstance(raw_args, dict):
+                    args_dict = raw_args
+                else:
+                    args_dict = {}
+                self._pending_tools[tool_call_id] = {
+                    "call_id": call_id,
+                    "ts_start": _now_iso_for_instrumentation(),
+                    "tool": tool_name,
+                    "args": args_dict,
+                }
+                logger.debug(
+                    "hook fired: on_tool_start call_id=%s tool=%s tool_call_id=%s session=%s",
+                    call_id,
+                    tool_name,
+                    tool_call_id,
+                    manifest.session_id,
+                )
+            except Exception as exc:
+                logger.warning("on_tool_start hook failed for session=%s: %s", manifest.session_id, exc)
+
+        async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
+            if not log_tool_hooks:
+                return
+            ts_end = _now_iso_for_instrumentation()
+            try:
+                tool_name = str(getattr(tool, "name", "unknown"))
+                tool_call_id = str(getattr(context, "tool_call_id", None) or "")
+                pending = self._pending_tools.pop(tool_call_id, None)
+                call_id = pending["call_id"] if pending else f"tc-{next(_tool_call_counter)}"
+                ts_start = pending["ts_start"] if pending else ts_end
+                args = pending["args"] if pending else None
+                is_error = isinstance(result, BaseException)
+                instrumenter.log_tool_call(
+                    call_id=call_id,
+                    ts_start=ts_start,
+                    ts_end=ts_end,
+                    tool=tool_name,
+                    args=args,
+                    success=not is_error,
+                    error=f"{type(result).__name__}: {result}" if is_error else None,
+                )
+                logger.debug(
+                    "wrote tool_call entry call_id=%s tool=%s session=%s success=%s",
+                    call_id,
+                    tool_name,
+                    manifest.session_id,
+                    not is_error,
+                )
+            except Exception as exc:
+                logger.warning("on_tool_end hook failed for session=%s: %s", manifest.session_id, exc)
+
+    return _InstrumentationHooks()
+
+
 def _instrument_event(event: Mapping[str, Any]) -> None:
     """Best-effort translation of a runner stdout event into instrumentation records.
 
@@ -208,6 +526,20 @@ def _instrument_event(event: Mapping[str, Any]) -> None:
         now = _now_iso_for_instrumentation()
 
         if event_type == "usage":
+            if _hook_llm_calls_logged > 0:
+                # Wave 4: the per-turn RunHooks path (_build_instrumentation_hooks)
+                # already wrote one llm-calls.jsonl entry per real LLM call this
+                # session. This aggregate "usage" event is still needed for
+                # stdout/cost-metering (_emit_session_usage), but mirroring it
+                # into llm-calls.jsonl too would append a stale duplicate
+                # aggregate entry on top of the N precise per-turn ones.
+                logger.debug(
+                    "_instrument_event: skipping aggregate llm-call mirror for usage "
+                    "event - %d precise per-turn entries already logged via RunHooks "
+                    "this session",
+                    _hook_llm_calls_logged,
+                )
+                return
             call_id = f"c-{next(_llm_call_counter)}"
             usage_missing = bool(event.get("usage_missing"))
             instrumenter.log_llm_call(
@@ -1717,6 +2049,22 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
         max_turns = _resolve_max_turns(manifest.max_turns)
         if max_turns is not None:
             run_sync_kwargs["max_turns"] = max_turns
+        if manifest.council is None:
+            # Wave 4 (per-turn instrumentation): only wired for the single-model
+            # Runner.run_sync path below - run_sync_kwargs is NOT forwarded into
+            # run_council (see the comment on the max_turns line above; a council
+            # role runs N whole-task candidates via its own internal Runner calls
+            # in bernstein.adapters.council_runner, which is a separate, currently
+            # un-instrumented-at-this-granularity code path - documented gap, see
+            # this function's docstring / wave-3 final report for the equivalent
+            # council caveat on usage accounting).
+            hooks_instance = _build_instrumentation_hooks(sdk, manifest)
+            run_sync_kwargs["hooks"] = hooks_instance
+            logger.debug(
+                "hook registration: passing hooks=%s to Runner.run_sync session=%s",
+                type(hooks_instance).__name__,
+                manifest.session_id,
+            )
         if manifest.council is not None:
             # Task-level council: run N candidates through the WHOLE task
             # in parallel, then a judge synthesizes one answer from their
@@ -1890,7 +2238,19 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
             # Wave 3 (per-agent instrumentation): log the full conversation
             # (input items + generated items + final output) from this run
             # to conversation.jsonl - see _log_result_conversation_messages.
-            _log_result_conversation_messages(result)
+            # Wave 4: skipped when the per-turn RunHooks path already logged
+            # this session's turns in REAL TIME via _log_hook_turn_conversation
+            # (see on_llm_end in _build_instrumentation_hooks) - running both
+            # would duplicate every message that already has a real-time entry.
+            if _hook_llm_calls_logged == 0:
+                _log_result_conversation_messages(result)
+            else:
+                logger.debug(
+                    "skipping post-hoc _log_result_conversation_messages for session=%s: "
+                    "%d turn(s) already logged in real time via RunHooks",
+                    manifest.session_id,
+                    _hook_llm_calls_logged,
+                )
     except Exception as exc:  # SDK errors are varied - catch broadly
         # D2 MiniMax attempt-3 (2026-07-03): agents that die on an
         # exception - especially ``MaxTurnsExceeded``, which by definition
@@ -1937,7 +2297,22 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
         # already reads for usage/pricing on the failure path). Mirror that
         # partial state into conversation.jsonl too so a failed run leaves
         # a full transcript of what happened before it died, not silence.
-        _log_result_conversation_messages(getattr(exc, "run_data", None))
+        # Wave 4: skipped when RunHooks already logged this session's
+        # completed turns in real time (see the success-path guard above for
+        # the identical reasoning) - only the turns that ran before the
+        # exception fired were ever hook-logged, but that is exactly the
+        # partial transcript this post-hoc call would otherwise re-derive
+        # from exc.run_data, so re-running it here would duplicate those
+        # entries rather than adding new ones.
+        if _hook_llm_calls_logged == 0:
+            _log_result_conversation_messages(getattr(exc, "run_data", None))
+        else:
+            logger.debug(
+                "skipping post-hoc _log_result_conversation_messages on exception path "
+                "for session=%s: %d turn(s) already logged in real time via RunHooks",
+                manifest.session_id,
+                _hook_llm_calls_logged,
+            )
         if _is_rate_limit(exc):
             emit_event(
                 {
