@@ -814,12 +814,29 @@ def _log_max_turns_exceeded(exc: BaseException, max_turns: int | None) -> None:
     )
 
 
-def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_desc: str) -> None:
+def _emit_session_usage(
+    manifest: RunnerManifest,
+    usage_source: Any,
+    *,
+    source_desc: str,
+    model: str | None = None,
+) -> None:
     """Extract, price, emit, and sidecar the session's token usage.
 
     Single choke point for usage accounting, callable from BOTH the success
     path (``usage_source`` = the SDK ``RunResult``) and the exception path
     (``usage_source`` = the exception's ``run_data`` payload, or ``None``).
+
+    A task-level council run (``manifest.council is not None``) calls this
+    once PER council member (each live candidate, plus the judge) instead
+    of once for the whole session, passing that member's own ``result``
+    object as ``usage_source`` and its real model id as ``model`` - see
+    ``bernstein.adapters.council_runner.CouncilRunResult.member_usage``.
+    Without the ``model`` override every council member would be priced
+    under ``manifest.model``, which for a council role is the ``.yaml``
+    config file path, not a real model id - that path isn't in the pricing
+    table, so ``price_model_usage`` fell back to $0 with a warning for
+    every council run. Passing each member's real model id here is the fix.
 
     D2 MiniMax attempt-3 (2026-07-03) proof: the usage-extraction block
     previously lived only after the ``try/except`` around
@@ -840,7 +857,13 @@ def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_d
         source_desc: Human-readable description of where ``usage_source``
             came from (e.g. ``"result"``, ``"MaxTurnsExceeded.run_data"``),
             logged so a $0 run names the exact path that produced it.
+        model: The real model id to price/report usage under. Defaults to
+            ``manifest.model`` - pass this explicitly for a council member
+            (its real candidate/judge model id), since ``manifest.model``
+            for a council role names the ``.yaml`` config file, not a
+            priceable model.
     """
+    model_id = model if model is not None else manifest.model
     input_tokens, output_tokens, tool_calls = _extract_usage_tokens(usage_source)
 
     if input_tokens <= 0 and output_tokens <= 0:
@@ -856,7 +879,7 @@ def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_d
             "data (usage is None/empty and raw_responses carried no usable "
             "usage) - cost metering for this call is unavailable, not zero",
             manifest.session_id,
-            manifest.model,
+            model_id,
             source_desc,
         )
         emit_event(
@@ -865,7 +888,7 @@ def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_d
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "tool_calls": tool_calls,
-                "model": manifest.model,
+                "model": model_id,
                 "usage_missing": True,
                 "usage_source": source_desc,
             },
@@ -881,7 +904,7 @@ def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_d
     # stdout-only "usage" event never reached it).
     from bernstein.core.cost.model_prices import price_model_usage
 
-    price_result = price_model_usage(manifest.model, input_tokens, output_tokens)
+    price_result = price_model_usage(model_id, input_tokens, output_tokens)
     # ``Runner.run_sync`` aggregates every internal turn into one cumulative
     # usage total (whether from ``result.usage``, the ``raw_responses``
     # fallback sum, or an exception's partial ``run_data``), so this call's
@@ -892,7 +915,7 @@ def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_d
         "llm_call session=%s model=%s source=%s input_tokens=%d "
         "output_tokens=%d cost_usd=%.6f priced=%s running_total_usd=%.6f",
         manifest.session_id,
-        manifest.model,
+        model_id,
         source_desc,
         input_tokens,
         output_tokens,
@@ -907,7 +930,7 @@ def _emit_session_usage(manifest: RunnerManifest, usage_source: Any, *, source_d
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "tool_calls": tool_calls,
-            "model": manifest.model,
+            "model": model_id,
             "cost_usd": price_result.cost_usd,
             "priced": price_result.priced,
             "running_total_usd": running_total_usd,
@@ -1566,7 +1589,28 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
     # ``RunResult``/``RunResultBase`` never define a ``usage`` attribute at
     # all, so the ``raw_responses`` fallback inside ``_extract_usage_tokens``
     # is the path that actually fires on real SDK result objects.
-    _emit_session_usage(manifest, result, source_desc="result")
+    #
+    # Council fix: ``manifest.model`` for a council role names the
+    # ``.yaml`` config file, not a real model id, so pricing the whole
+    # council under it looked up the yaml path in the pricing table and
+    # metered at $0 with a warning. When the council ran, ``result`` is a
+    # ``CouncilRunResult`` carrying ``member_usage`` - one entry per live
+    # candidate plus the judge, each with its own real model id and its
+    # own result object (see
+    # ``bernstein.adapters.council_runner.CouncilRunResult``). Emit one
+    # usage event per member, priced under that member's real model,
+    # instead of one aggregate event priced under the yaml path.
+    member_usage = getattr(result, "member_usage", None) if manifest.council is not None else None
+    if member_usage:
+        for member in member_usage:
+            _emit_session_usage(
+                manifest,
+                member.get("result"),
+                source_desc=f"council:{member.get('label')}",
+                model=member.get("model"),
+            )
+    else:
+        _emit_session_usage(manifest, result, source_desc="result")
 
     emit_event(
         {
