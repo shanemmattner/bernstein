@@ -3512,6 +3512,13 @@ def process_completed_tasks(
         if task.id in orch._processed_done_tasks:
             continue
         orch._processed_done_tasks[task.id] = None
+        # Mirror the "chain started" marker into an unbounded, non-FIFO-
+        # evicted set so the drain tracker (_refresh_drain_tracker) can
+        # still recognize a started chain even if this task's id later
+        # falls out of the FIFO-capped ``_processed_done_tasks`` cache.
+        chain_started = getattr(orch, "_post_complete_chain_started", None)
+        if chain_started is not None:
+            chain_started.add(task.id)
         new_tasks.append(task)
 
     if not new_tasks:
@@ -3736,6 +3743,16 @@ def _apply_janitor_verdict_action(orch: Any, task: Task, janitor_passed: bool) -
             orch._processed_done_tasks.pop(task.id, None)
         except Exception:  # pragma: no cover - defensive, dict-like expected
             logger.debug("janitor_verdict_action: could not clear processed marker for %s", task.id)
+        # Mirror the clear into the non-FIFO-evicted chain-started set (see
+        # _post_complete_chain_started) so a reopened task's drain state
+        # gets reset consistently and process_completed_tasks re-adds it
+        # when the next completion comes through.
+        try:
+            chain_started = getattr(orch, "_post_complete_chain_started", None)
+            if chain_started is not None:
+                chain_started.discard(task.id)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("janitor_verdict_action: could not clear chain-started marker for %s", task.id)
         logger.info(
             "janitor_verdict_action: task=%s verdict=FAIL action=reopen cycle=%d/%d",
             task.id,
