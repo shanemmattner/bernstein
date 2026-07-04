@@ -139,6 +139,48 @@ class QualityGatesSchema(BaseModel):
     verify_citations_allowed_hosts: list[str] | None = None
 
 
+class CouncilCandidateConfig(BaseModel):
+    """One candidate (or judge) endpoint in a ``council`` block.
+
+    Mirrors the subset of :class:`RoleModelPolicyEntry`'s endpoint fields
+    a single council member needs: which model, and optionally which
+    OpenAI-compatible endpoint/credential to reach it through. ``base_url``
+    /``api_key_env`` follow the exact same semantics and fail-closed
+    credential-allowlist validation as the top-level role policy fields of
+    the same name (see :class:`RoleModelPolicyEntry`) - ``api_key_env`` is
+    always the NAME of an environment variable, never a literal key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    base_url: str | None = None
+    api_key_env: str | None = None
+
+
+class CouncilConfig(BaseModel):
+    """"Council of agents" fan-out/judge configuration for one role.
+
+    When set on a :class:`RoleModelPolicyEntry` (or loaded from a
+    ``role_model_policy.<role>.model: "*.yaml"`` council definition file -
+    see ``openai_agents_runner._load_council_config``), the role's ENTIRE
+    task run is driven by a task-level council instead of a single model:
+    every ``candidates`` entry runs the WHOLE task independently in
+    parallel (its own full multi-turn run), then ``judge`` synthesizes one
+    improved answer from whichever candidates survived. See
+    ``src/bernstein/adapters/council_runner.py`` (``run_council``) for the
+    runtime implementation and ``openai_agents_runner._run_session``'s
+    ``manifest.council`` branch for how this config drives a run instead of
+    a single ``Runner.run_sync`` call.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[CouncilCandidateConfig]
+    judge: CouncilCandidateConfig
+    timeout: float = 60.0
+
+
 class RoleModelPolicyEntry(BaseModel):
     """Per-role model/provider policy.
 
@@ -178,6 +220,12 @@ class RoleModelPolicyEntry(BaseModel):
     top_k: int | None = None
     max_tokens: int | None = None
     extra_params: dict[str, Any] = Field(default_factory=dict)
+    # Optional "council of agents" fan-out/judge override (see
+    # ``CouncilConfig``). When set, this role's ENTIRE task run is driven by
+    # a task-level council (``bernstein.adapters.council_runner.run_council``)
+    # instead of a single model; ``model``/``base_url``/``api_key_env`` above
+    # are then ignored in favor of the council's own per-candidate endpoints.
+    council: CouncilConfig | None = None
 
 
 class RoleConfigEntry(BaseModel):

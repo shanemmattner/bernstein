@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import TYPE_CHECKING, Any, cast
 
 from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
@@ -95,6 +96,14 @@ def _coerce_model_for_non_claude_adapter(
     if model_config.model not in _CLAUDE_TIER_MODELS:
         return model_config
     if not adapter_default_model:
+        print(
+            "[SPAWNER-DEBUG] _coerce_model_for_non_claude_adapter: RAISING ModelNotConfiguredError - "
+            f"model_config.model={model_config.model!r} is a Claude tier name, adapter_name="
+            f"{adapter_name!r} is non-Claude, adapter_default_model={adapter_default_model!r} "
+            "(falsy) - no fallback model available.",
+            file=sys.stderr,
+            flush=True,
+        )
         raise ModelNotConfiguredError(
             f"Model '{model_config.model}' is an unpinned Claude tier name but adapter "
             f"'{adapter_name}' is not Claude-compatible and has no default_model configured. "
@@ -196,9 +205,25 @@ def _select_batch_config(
 
     def _route_for_batch(task: Task) -> ModelConfig:
         """Batch-specific routing: consult bandit when available, else heuristics."""
+        print(
+            f"[SPAWNER-DEBUG] _route_for_batch: task.id={task.id!r}, task.role={task.role!r}, "
+            f"task.model={task.model!r}, task.effort={task.effort!r}, default_model={default_model!r}. "
+            "NOTE: role_model_policy is not passed into _select_batch_config/_route_for_batch's "
+            "scope - the caller (spawner_core.py) resolves role_model_policy separately via "
+            "self._role_model_policy.get(task.role, {}) after this function returns.",
+            file=sys.stderr,
+            flush=True,
+        )
         if task.model or task.effort:
             model = task.model or default_model
             if model is None:
+                print(
+                    f"[SPAWNER-DEBUG] _route_for_batch: RAISING ModelNotConfiguredError (branch: "
+                    f"task.model/task.effort set) - task.id={task.id!r}, task.effort={task.effort!r}, "
+                    f"task.model={task.model!r}, default_model={default_model!r} (also falsy).",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 raise ModelNotConfiguredError(
                     f"Task {task.id} has effort={task.effort!r} but no model, and no "
                     "default_model is configured. Refusing to guess a model.",
@@ -206,6 +231,13 @@ def _select_batch_config(
             return ModelConfig(model=model, effort=task.effort or "normal")
         if task.role in _HIGH_STAKES_ROLES or task.scope == Scope.LARGE or task.priority == 1:
             if default_model is None:
+                print(
+                    f"[SPAWNER-DEBUG] _route_for_batch: RAISING ModelNotConfiguredError (branch: "
+                    f"high-stakes/large-scope/priority1) - task.id={task.id!r}, task.role={task.role!r}, "
+                    f"task.scope={task.scope!r}, task.priority={task.priority!r}, default_model=None.",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 raise ModelNotConfiguredError(
                     f"Task {task.id} (role={task.role}) is high-stakes but no default_model "
                     "is configured. Refusing to guess a model.",
@@ -213,6 +245,13 @@ def _select_batch_config(
             return ModelConfig(model=default_model, effort="max")
         if task.complexity == Complexity.HIGH:
             if default_model is None:
+                print(
+                    f"[SPAWNER-DEBUG] _route_for_batch: RAISING ModelNotConfiguredError (branch: "
+                    f"HIGH complexity) - task.id={task.id!r}, task.complexity={task.complexity!r}, "
+                    "default_model=None.",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 raise ModelNotConfiguredError(
                     f"Task {task.id} has HIGH complexity but no default_model is configured. "
                     "Refusing to guess a model.",

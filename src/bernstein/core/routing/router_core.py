@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -921,6 +922,15 @@ def route_task(
     Returns:
         ModelConfig with selected model and effort (and is_batch flag).
     """
+    print(
+        f"[SPAWNER-DEBUG] route_task: ENTRY task.id={getattr(task, 'id', '?')!r}, "
+        f"task.role={getattr(task, 'role', '?')!r}, task.model={getattr(task, 'model', None)!r}, "
+        f"task.effort={getattr(task, 'effort', None)!r}, bandit_metrics_dir={bandit_metrics_dir!r}, "
+        f"workdir={workdir!r}, budget_remaining_usd={budget_remaining_usd!r}, "
+        f"budget_aware_routing_enabled={budget_aware_routing_enabled!r}, default_model={default_model!r}",
+        file=sys.stderr,
+        flush=True,
+    )
     cfg = _select_model_config(
         task,
         bandit_metrics_dir,
@@ -1179,10 +1189,27 @@ def _select_model_config(
             of its own, routing raises :class:`ModelNotConfiguredError`
             rather than silently picking Claude Sonnet/Opus.
     """
+    print(
+        f"[SPAWNER-DEBUG] _select_model_config: ENTRY task.id={getattr(task, 'id', '?')!r}, "
+        f"task.role={getattr(task, 'role', '?')!r}, task.model={getattr(task, 'model', None)!r}, "
+        f"task.effort={getattr(task, 'effort', None)!r}, task.scope={getattr(task, 'scope', None)!r}, "
+        f"task.priority={getattr(task, 'priority', None)!r}, "
+        f"task.complexity={getattr(task, 'complexity', None)!r}, default_model={default_model!r}",
+        file=sys.stderr,
+        flush=True,
+    )
     # Manager-specified overrides take precedence
     if task.model or task.effort:
         model = task.model or default_model
         if model is None:
+            print(
+                f"[SPAWNER-DEBUG] _select_model_config: RAISING ModelNotConfiguredError (branch: "
+                f"manager override, task.model/task.effort set) - task.id={task.id!r}, "
+                f"task.effort={task.effort!r}, task.model={task.model!r}, checked default_model="
+                f"{default_model!r} (also falsy/None).",
+                file=sys.stderr,
+                flush=True,
+            )
             raise ModelNotConfiguredError(
                 f"Task {task.id} has effort={task.effort!r} but no model, and no "
                 "default_model is configured (role_model_policy/seed/adapter default). "
@@ -1217,6 +1244,13 @@ def _select_model_config(
     )
     if opus_reason is not None:
         if default_model is None:
+            print(
+                f"[SPAWNER-DEBUG] _select_model_config: RAISING ModelNotConfiguredError (branch: "
+                f"opus override) - task.id={task.id!r}, opus_reason={opus_reason!r}, "
+                "default_model=None.",
+                file=sys.stderr,
+                flush=True,
+            )
             raise ModelNotConfiguredError(
                 f"Task {task.id} triggered a high-stakes opus override ({opus_reason}) but "
                 "no default_model is configured. Refusing to guess a model - configure one "
@@ -1239,6 +1273,16 @@ def _select_model_config(
     # configure one (role_model_policy/seed/adapter default) or routing
     # refuses rather than silently spending on Claude Sonnet.
     if default_model is None:
+        print(
+            f"[SPAWNER-DEBUG] _select_model_config: RAISING ModelNotConfiguredError (branch: "
+            f"heuristic fallback, no criterion/opus/l1/bandit match) - task.id={task.id!r}, "
+            f"task.role={task.role!r}, task.complexity={task.complexity.value!r}, "
+            "default_model=None. Checked: task.model/effort (unset), criterion_profile "
+            "(no bias), opus_override (not triggered), l1_fast_path (no match), "
+            "bandit_selection (no metrics_dir or failed).",
+            file=sys.stderr,
+            flush=True,
+        )
         raise ModelNotConfiguredError(
             f"Task {task.id} (role={task.role}, complexity={task.complexity.value}) has no "
             "model configured on the task and no default_model was supplied to the router. "

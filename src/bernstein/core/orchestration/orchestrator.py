@@ -4869,6 +4869,7 @@ def _collect_smtp_targets(seed: Any, targets: list[NotificationTarget]) -> None:
 if __name__ == "__main__":
     import argparse
     import sys
+    import traceback
     from pathlib import Path
 
     from bernstein.adapters.registry import get_adapter
@@ -4906,6 +4907,21 @@ if __name__ == "__main__":
         default=os.environ.get("BERNSTEIN_SEED_PATH", "").strip() or None,
     )
     args = parser.parse_args()
+
+    print(f"[SPAWNER-DEBUG] orchestrator __main__: parsed CLI args={vars(args)!r}", file=sys.stderr, flush=True)
+    print(
+        f"[SPAWNER-DEBUG] orchestrator __main__: BERNSTEIN_SEED_PATH env var="
+        f"{os.environ.get('BERNSTEIN_SEED_PATH', '<unset>')!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(
+        f"[SPAWNER-DEBUG] orchestrator __main__: BERNSTEIN_ADAPTER env var="
+        f"{os.environ.get('BERNSTEIN_ADAPTER', '<unset>')!r}, BERNSTEIN_MODEL env var="
+        f"{os.environ.get('BERNSTEIN_MODEL', '<unset>')!r}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     workdir = Path.cwd()
 
@@ -4979,10 +4995,19 @@ if __name__ == "__main__":
         # the real store is set after the orchestrator assigns its run_id below.
         pass  # store will be set after orchestrator is instantiated
 
+    print("[SPAWNER-DEBUG] orchestrator __main__: entering top-level try block", file=sys.stderr, flush=True)
     try:
         # Try to load adapter from seed if available
         adapter_name = args.adapter
         seed_path = Path(args.seed_path) if args.seed_path else resolve_seed_path(workdir)
+        print(
+            f"[SPAWNER-DEBUG] orchestrator __main__: seed_path resolution: "
+            f"args.seed_path={args.seed_path!r}, resolve_seed_path(workdir)="
+            f"{resolve_seed_path(workdir)!r}, FINAL seed_path={seed_path!r}, "
+            f"os.path.exists(seed_path)={os.path.exists(seed_path)}",
+            file=sys.stderr,
+            flush=True,
+        )
         logger.info(
             "orchestrator __main__: resolved seed_path=%s (from --seed-path=%s, exists=%s)",
             seed_path,
@@ -4991,9 +5016,37 @@ if __name__ == "__main__":
         )
         seed: SeedConfig | None = None
         if seed_path.exists():
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: seed file exists at {seed_path}, "
+                "attempting parse_seed()",
+                file=sys.stderr,
+                flush=True,
+            )
             try:
                 seed = parse_seed(seed_path)
                 adapter_name = getattr(seed, "cli", adapter_name)
+                _seed_role_model_policy = getattr(seed, "role_model_policy", None)
+                if not _seed_role_model_policy:
+                    print(
+                        "[SPAWNER-DEBUG] orchestrator __main__: role_model_policy is None/empty "
+                        f"after seed parse (seed_path={seed_path})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[SPAWNER-DEBUG] orchestrator __main__: parsed role_model_policy="
+                        f"{json.dumps(_seed_role_model_policy, default=str)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                print(
+                    "[SPAWNER-DEBUG] orchestrator __main__: seed parse SUCCESS - cli="
+                    f"{getattr(seed, 'cli', None)!r}, top-level model="
+                    f"{getattr(seed, 'model', None)!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 logger.info(
                     "orchestrator __main__: parsed seed from %s (cli=%s, model=%s, role_model_policy=%s)",
                     seed_path,
@@ -5002,7 +5055,20 @@ if __name__ == "__main__":
                     getattr(seed, "role_model_policy", None),
                 )
             except Exception as exc:
+                print(
+                    f"[SPAWNER-DEBUG] orchestrator __main__: seed parse FAILED for {seed_path}: "
+                    f"{exc!r}\n{traceback.format_exc()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 logger.warning("Failed to parse seed for adapter config: %s", exc)
+        else:
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: seed file does NOT exist at {seed_path} "
+                "- role_model_policy and model will be unset from seed",
+                file=sys.stderr,
+                flush=True,
+            )
 
         if not adapter_name:
             logger.error(
@@ -5018,6 +5084,13 @@ if __name__ == "__main__":
         # so child-task spawns can coerce Claude tier names for non-Claude
         # adapters instead of passing them through literally.
         run_model: str | None = args.model or (getattr(seed, "model", None) if seed else None)
+        print(
+            f"[SPAWNER-DEBUG] orchestrator __main__: resolved run_model={run_model!r} "
+            f"(args.model={args.model!r}, seed.model="
+            f"{getattr(seed, 'model', None) if seed else '<no seed>'!r})",
+            file=sys.stderr,
+            flush=True,
+        )
 
         if adapter_name == "auto":
             # Auto mode: default to Claude Code (primary), others used via routing
@@ -5326,6 +5399,14 @@ if __name__ == "__main__":
             ),
         )
 
+        _spawner_role_model_policy = seed.role_model_policy if seed else None
+        print(
+            "[SPAWNER-DEBUG] orchestrator __main__: constructing AgentSpawner with "
+            f"role_model_policy={json.dumps(_spawner_role_model_policy, default=str) if _spawner_role_model_policy else '<None/empty>'}, "
+            f"default_model={run_model!r}, adapter={adapter_inst!r}",
+            file=sys.stderr,
+            flush=True,
+        )
         spawner = AgentSpawner(
             adapter=adapter_inst,
             templates_dir=get_templates_dir(workdir) / "roles",
@@ -5528,7 +5609,24 @@ if __name__ == "__main__":
                 if mcp_manager is not None:
                     mcp_manager.stop_all()
     except Exception:
+        _crash_tb = traceback.format_exc()
+        print(f"[SPAWNER-DEBUG] orchestrator __main__: FATAL uncaught exception:\n{_crash_tb}", file=sys.stderr, flush=True)
         logger.exception("Orchestrator crashed")
+        try:
+            _crash_log_dir = workdir / ".sdd" / "runtime"
+            os.makedirs(_crash_log_dir, exist_ok=True)
+            _crash_log_path = _crash_log_dir / "spawner_crash.log"
+            with open(_crash_log_path, "a", encoding="utf-8") as _crash_fh:
+                _crash_fh.write(f"\n=== spawner crash at {datetime.now(UTC).isoformat()} ===\n")
+                _crash_fh.write(_crash_tb)
+                _crash_fh.write("\n")
+            print(f"[SPAWNER-DEBUG] orchestrator __main__: crash traceback appended to {_crash_log_path}", file=sys.stderr, flush=True)
+        except Exception as _log_exc:  # pragma: no cover - crash logging must never itself crash the reporting path
+            print(
+                f"[SPAWNER-DEBUG] orchestrator __main__: FAILED to write spawner_crash.log: {_log_exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
         sys.exit(1)
 # ---------------------------------------------------------------------------
 # Meta-messages for orchestrator nudges (T567)

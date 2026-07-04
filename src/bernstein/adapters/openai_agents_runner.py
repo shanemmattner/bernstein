@@ -58,7 +58,12 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+import yaml
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +299,37 @@ class RunnerManifest:
     # direct invocation) and the runner's own env/defaults apply.
     allow_run_command: bool | None = None
     max_turns: int | None = None
+    # Optional TASK-LEVEL "council of agents" fan-out/judge override (see
+    # ``bernstein.adapters.council_runner.run_council`` and
+    # ``bernstein.core.config.config_schema.CouncilConfig``). Shape::
+    #
+    #     {"candidates": [{"model": "...", "base_url": "...", "api_key_env": "..."}, ...],
+    #      "judge": {"model": "...", "base_url": "...", "api_key_env": "..."},
+    #      "timeout": 60.0}
+    #
+    # ``base_url``/``api_key_env`` are optional per-member endpoint
+    # overrides, resolved through the exact same
+    # ``_resolve_client_kwargs``/``validate_api_key_env_name`` path as the
+    # top-level ``base_url``/``api_key_env`` fields above.
+    #
+    # This field is usually populated INDIRECTLY: when ``model`` (above)
+    # names a ``.yaml``/``.yml`` file (the ``role_model_policy.<role>.model:
+    # "councils/foo.yaml"`` convention), :func:`_load_council_config`
+    # resolves that file relative to ``.bernstein/`` in ``workdir``, parses
+    # it into this exact shape, and :func:`run` rebuilds the manifest with
+    # this field populated before ``_run_session`` runs. A caller MAY also
+    # set this field directly (e.g. a hand-written manifest for a direct
+    # invocation/test) - it is then used as-is and ``model``'s ``.yaml``
+    # suffix is not re-checked.
+    #
+    # When set (by either path), each candidate runs the WHOLE task to
+    # completion independently (its own full ``Runner.run``), then a judge
+    # model synthesizes one improved answer from every candidate's final
+    # output - see :func:`run_council <bernstein.adapters.council_runner.run_council>`
+    # for the task-level implementation the ``manifest.council`` branch in
+    # :func:`_run_session` calls instead of ``Runner.run_sync``. ``None``
+    # (the default) preserves today's single-model behavior exactly.
+    council: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> RunnerManifest:
@@ -391,7 +427,17 @@ def _build_agent_kwargs(manifest: RunnerManifest) -> dict[str, Any]:
     instructions = manifest.system_addendum or None
     kwargs: dict[str, Any] = {
         "name": f"bernstein-{manifest.session_id}",
-        "model": manifest.model,
+        # A council role's ``model`` only ever names a council YAML file
+        # path (already resolved into ``manifest.council`` by
+        # ``_load_council_config`` before this is called) - it is never a
+        # real model id, so it must never be handed to ``Agent(model=...)``
+        # (the SDK would try to resolve the literal path string as a
+        # provider/model id and fail). Leaving it ``None`` here is safe:
+        # this base ``Agent`` definition is only ever used as a
+        # ``.clone(model=...)`` template inside
+        # ``bernstein.adapters.council_runner.run_council`` - it is never
+        # itself passed to ``Runner.run``/``Runner.run_sync``.
+        "model": None if manifest.council is not None else manifest.model,
     }
     if instructions:
         kwargs["instructions"] = instructions
@@ -479,6 +525,146 @@ def _resolve_client_kwargs(manifest: RunnerManifest) -> dict[str, Any]:
             raise RuntimeError(msg)
         kwargs["api_key"] = api_key
     return kwargs
+
+
+def _resolve_council_member_client_kwargs(member: Mapping[str, Any]) -> dict[str, Any]:
+    """Build ``AsyncOpenAI(...)`` kwargs for one council candidate/judge member.
+
+    Mirrors :func:`_resolve_client_kwargs` but reads ``base_url``/
+    ``api_key_env`` from a single council member dict (one entry of
+    ``manifest.council["candidates"]`` or ``manifest.council["judge"]``)
+    instead of the top-level manifest fields, since each council member
+    may target a different endpoint/credential.
+
+    Raises:
+        RuntimeError: ``api_key_env`` is set but fails
+            :func:`validate_api_key_env_name`, or the named environment
+            variable is missing or empty.
+    """
+    kwargs: dict[str, Any] = {}
+    base_url = member.get("base_url")
+    if base_url:
+        kwargs["base_url"] = base_url
+    api_key_env = member.get("api_key_env")
+    if api_key_env:
+        validate_api_key_env_name(api_key_env)
+        api_key = os.environ.get(api_key_env)
+        if not api_key:
+            msg = (
+                f"council member {member.get('model')!r} names api_key_env "
+                f"{api_key_env!r} but it is not set. Export {api_key_env} before "
+                f"spawning the openai_agents runner."
+            )
+            raise RuntimeError(msg)
+        kwargs["api_key"] = api_key
+    return kwargs
+
+
+def _resolve_council_config_path(manifest: RunnerManifest, council_path: str) -> Path:
+    """Resolve a council YAML file reference relative to ``.bernstein/`` in the workdir.
+
+    Args:
+        manifest: The parsed manifest (only ``workdir`` is used).
+        council_path: The raw ``.yaml``/``.yml`` string from
+            ``manifest.model`` (e.g. ``"councils/planning.yaml"``).
+
+    Returns:
+        Absolute path: ``council_path`` unchanged if already absolute,
+        otherwise ``<workdir>/.bernstein/<council_path>``.
+    """
+    candidate = Path(council_path)
+    if candidate.is_absolute():
+        return candidate
+    return Path(manifest.workdir) / ".bernstein" / candidate
+
+
+def _load_council_config(manifest: RunnerManifest) -> dict[str, Any] | None:
+    """Resolve the effective council config for this run, if any.
+
+    Two ways a run ends up with a council config:
+
+    1. ``manifest.council`` is already populated (e.g. a hand-written
+       manifest for a direct invocation/test) - returned unchanged,
+       ``manifest.model`` is not inspected.
+    2. ``manifest.model`` names a ``.yaml``/``.yml`` file (the
+       ``role_model_policy.<role>.model: "councils/foo.yaml"`` convention -
+       see :class:`RunnerManifest`'s ``council`` field docstring). The file
+       is resolved relative to ``.bernstein/`` in ``manifest.workdir`` (see
+       :func:`_resolve_council_config_path`), parsed as YAML, and validated
+       to have a non-empty ``candidates`` list and a ``judge`` mapping -
+       the same shape :func:`bernstein.adapters.council_runner.run_council`
+       expects (mirrors
+       :class:`bernstein.core.config.config_schema.CouncilConfig`).
+
+    Returns:
+        The parsed council config dict, or ``None`` when neither applies -
+        the ordinary single-model path (unchanged behavior).
+
+    Raises:
+        RuntimeError: ``manifest.model`` ends in ``.yaml``/``.yml`` but the
+            referenced file does not exist, is not valid YAML, is not a
+            mapping, or is missing a non-empty ``candidates`` list / a
+            ``judge`` mapping. Surfaced to :func:`run`'s existing
+            ``config_invalid`` error path exactly like any other
+            manifest-time misconfiguration.
+    """
+    if manifest.council is not None:
+        logger.info(
+            "openai_agents_runner session=%s: manifest.council already populated - "
+            "using it as-is (manifest.model=%r is not inspected for a .yaml suffix)",
+            manifest.session_id,
+            manifest.model,
+        )
+        return manifest.council
+
+    if not (manifest.model.endswith(".yaml") or manifest.model.endswith(".yml")):
+        return None
+
+    config_path = _resolve_council_config_path(manifest, manifest.model)
+    logger.info(
+        "openai_agents_runner session=%s: manifest.model=%r ends in .yaml/.yml - "
+        "loading it as a council definition file from %s",
+        manifest.session_id,
+        manifest.model,
+        config_path,
+    )
+    if not config_path.exists():
+        msg = (
+            f"manifest.model {manifest.model!r} looks like a council definition file "
+            f"(ends in .yaml/.yml) but {config_path} does not exist"
+        )
+        raise RuntimeError(msg)
+
+    try:
+        raw_text = config_path.read_text(encoding="utf-8")
+        parsed: object = yaml.safe_load(raw_text)
+    except (OSError, yaml.YAMLError) as exc:
+        msg = f"failed to read/parse council file {config_path}: {type(exc).__name__}: {exc}"
+        raise RuntimeError(msg) from exc
+
+    if not isinstance(parsed, dict):
+        msg = f"council file {config_path} must be a YAML mapping, got {type(parsed).__name__}"
+        raise RuntimeError(msg)
+
+    raw_candidates = parsed.get("candidates")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        msg = f"council file {config_path}: 'candidates' must be a non-empty list"
+        raise RuntimeError(msg)
+    raw_judge = parsed.get("judge")
+    if not isinstance(raw_judge, dict):
+        msg = f"council file {config_path}: 'judge' is required and must be a mapping"
+        raise RuntimeError(msg)
+
+    logger.info(
+        "openai_agents_runner session=%s: council file %s parsed OK: %d candidates, "
+        "judge model=%r, timeout=%r",
+        manifest.session_id,
+        config_path,
+        len(raw_candidates),
+        raw_judge.get("model"),
+        parsed.get("timeout"),
+    )
+    return cast("dict[str, Any]", parsed)
 
 
 def _resolve_tokens_sidecar_path(manifest: RunnerManifest) -> Path:
@@ -893,6 +1079,27 @@ def run(manifest: RunnerManifest) -> int:
         },
     )
 
+    # Resolve a task-level council config BEFORE any other SDK work, so a
+    # malformed council YAML file (missing/unreadable/missing
+    # candidates-or-judge) fails loudly at startup instead of mid-session.
+    # When ``manifest.model`` names a council file this REPLACES ``manifest``
+    # with a copy carrying ``council`` populated - every downstream read of
+    # ``manifest.council`` (here and in ``_run_session``) sees the resolved
+    # config from this point on.
+    try:
+        council_cfg = _load_council_config(manifest)
+    except RuntimeError as exc:
+        emit_event(
+            {
+                "type": "error",
+                "kind": "config_invalid",
+                "message": str(exc),
+            },
+        )
+        return EXIT_MANIFEST_ERROR
+    if council_cfg is not None and manifest.council is None:
+        manifest = dataclasses.replace(manifest, council=council_cfg)
+
     # Resolve the endpoint override before any SDK work so a missing key
     # env var fails loudly at startup instead of mid-session.
     try:
@@ -962,7 +1169,14 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
     # built against explicitly (see the ``explicit_model_client`` usage
     # below ``_build_agent_kwargs``).
     explicit_model_client: Any = None
-    if client_kwargs:
+    if client_kwargs and manifest.council is None:
+        # Skipped when ``manifest.council`` is set: a council role builds
+        # one dedicated ``AsyncOpenAI`` client PER council member (see
+        # ``bernstein.adapters.council_runner.run_council``), so the single
+        # top-level client/default-client dance here does not apply - each
+        # member resolves its own endpoint independently of the role's
+        # top-level ``base_url``/``api_key_env``.
+        #
         # The manifest overrides the endpoint and/or API key.  Hand the SDK
         # a dedicated client instead of letting it read the ambient
         # OPENAI_* environment.
@@ -1022,7 +1236,28 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
     max_turns: int | None = None
     try:
         agent_kwargs = _build_agent_kwargs(manifest)
-        if explicit_model_client is not None:
+        if manifest.council is not None:
+            # TASK-LEVEL council override: this role's ENTIRE task run is
+            # driven by N candidate models running the whole task
+            # independently in parallel, then a judge model synthesizes one
+            # improved answer from their outputs - see
+            # ``bernstein.adapters.council_runner.run_council``, called
+            # below instead of ``Runner.run_sync``. ``_build_agent_kwargs``
+            # already left this base agent's ``model`` unset (``None``) for
+            # a council role (manifest.model only ever names the council
+            # YAML file, never a real model id) - ``run_council`` builds
+            # each candidate/judge's own model via
+            # ``agent.clone(model=...)`` off this same base definition, so
+            # no model needs to be set on ``agent_kwargs`` here.
+            logger.info(
+                "openai_agents_runner session=%s: council enabled for this role (%d "
+                "candidates configured) - manifest.model=%r names the council file, "
+                "not a real model id",
+                manifest.session_id,
+                len(manifest.council.get("candidates", [])),
+                manifest.model,
+            )
+        elif explicit_model_client is not None:
             # Never log the client itself (it carries the API key) - only
             # the model id and base_url, both non-secret.
             logger.info(
@@ -1104,155 +1339,175 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
         max_turns = _resolve_max_turns(manifest.max_turns)
         if max_turns is not None:
             run_sync_kwargs["max_turns"] = max_turns
-        # [DEEPSEEK-DEBUG] Unconditional (not gated behind a debug flag)
-        # pre-call diagnostic for the deepseek/deepseek-chat-via-OpenRouter
-        # empty-completion / malformed-tool-call investigation (2026-07-03).
-        # Logged at INFO so it is captured on every run without operator
-        # opt-in. Never logs the API key itself - only the env var NAME.
-        _model_settings_obj = agent_kwargs.get("model_settings")
-        _model_settings_repr = (
-            {
-                "temperature": getattr(_model_settings_obj, "temperature", None),
-                "top_p": getattr(_model_settings_obj, "top_p", None),
-                "tool_choice": getattr(_model_settings_obj, "tool_choice", None),
-                "parallel_tool_calls": getattr(_model_settings_obj, "parallel_tool_calls", None),
-                "max_tokens": getattr(_model_settings_obj, "max_tokens", None),
-                "extra_args": getattr(_model_settings_obj, "extra_args", None),
-                # extra_headers/extra_body are the SDK-conventional home for
-                # provider auth (Authorization/api-key). Log only the KEY NAMES,
-                # never the values, so this diagnostic can never leak a secret
-                # if an auth header is ever configured here.
-                "extra_headers_keys": _redacted_keys(getattr(_model_settings_obj, "extra_headers", None)),
-                "extra_body_keys": _redacted_keys(getattr(_model_settings_obj, "extra_body", None)),
-            }
-            if _model_settings_obj is not None
-            else "<no ModelSettings constructed - settings_kwargs was empty>"
-        )
-        _tool_list_for_log = agent_kwargs.get("tools", [])
-        # Only the NAME of the credential environment variable is logged here,
-        # never the secret value it resolves to.
-        _key_env_name_for_log = manifest.api_key_env
-        logger.info(
-            "[DEEPSEEK-DEBUG] pre-call session=%s model=%r base_url=%r api_key_env=%r "
-            "explicit_model_client=%s tool_source=%r tool_count=%d max_turns=%s",
-            manifest.session_id,
-            manifest.model,
-            manifest.base_url,
-            _key_env_name_for_log,
-            explicit_model_client is not None,
-            manifest.tool_source,
-            len(_tool_list_for_log),
-            max_turns,
-        )
-        logger.info(
-            "[DEEPSEEK-DEBUG] pre-call session=%s model_settings=%s "
-            "(tool_choice/parallel_tool_calls of None means the SDK/provider "
-            "default applies - bernstein never sets these explicitly)",
-            manifest.session_id,
-            _model_settings_repr,
-        )
-        logger.info(
-            "[DEEPSEEK-DEBUG] pre-call session=%s no extra_headers configured by bernstein "
-            "(no HTTP-Referer/X-Title sent to OpenRouter unless the SDK's own default "
-            "HEADERS constant includes them) - client_kwargs base_url=%r",
-            manifest.session_id,
-            client_kwargs.get("base_url"),
-        )
-        try:
-            _tool_schema_summary = _deepseek_debug_tool_schema_summary(_tool_list_for_log)
+        if manifest.council is not None:
+            # Task-level council: run N candidates through the WHOLE task
+            # in parallel, then a judge synthesizes one answer from their
+            # outputs. Imported lazily (not at module top level) to match
+            # this module's existing lazy-SDK-adjacent-import convention
+            # for optional adapter subsystems (see the
+            # ``bernstein.adapters.openai_agents_builtins`` import elsewhere
+            # in this function). ``run_council`` resolves its own
+            # ``max_turns`` internally (mirrors this same
+            # ``_resolve_max_turns`` call), so it is not forwarded here.
+            from bernstein.adapters.council_runner import run_council
+
             logger.info(
-                "[DEEPSEEK-DEBUG] pre-call session=%s tool_schemas=%s",
+                "openai_agents_runner session=%s: running task-level council instead of "
+                "a single Runner.run_sync call (%d candidates configured)",
                 manifest.session_id,
-                json.dumps(_tool_schema_summary, default=str)[:8000],
+                len(manifest.council.get("candidates", [])),
             )
-            _any_strict_true = any(entry.get("strict_json_schema") is True for entry in _tool_schema_summary)
-            if _any_strict_true:
-                logger.warning(
-                    "[DEEPSEEK-DEBUG] pre-call session=%s: at least one tool schema has "
-                    "strict_json_schema=True - the OpenAI Agents SDK sends this as "
-                    "'strict': true in the ChatCompletionToolParam.function block "
-                    "(agents/models/chatcmpl_converter.py Converter.tool_to_openai). "
-                    "This is the leading hypothesis for deepseek-chat-via-OpenRouter "
-                    "empty/malformed tool_calls - deepseek's function calling is not "
-                    "confirmed to fully support OpenAI's strict structured-output mode.",
-                    manifest.session_id,
-                )
-        except Exception as exc:  # diagnostics only - never mask the real failure
-            logger.warning(
-                "[DEEPSEEK-DEBUG] pre-call session=%s: tool schema logging itself failed: %s: %s",
-                manifest.session_id,
-                type(exc).__name__,
-                exc,
-            )
-
-        # ``Runner.run_sync`` is the SDK's synchronous API - we avoid
-        # ``asyncio.run`` here so the runner stays compatible with
-        # environments where the event loop is already running
-        # (e.g. pytest-asyncio tests that import this module). ``max_turns``
-        # is only forwarded when configured (env/tuning) - omitting the
-        # kwarg preserves the SDK's own default exactly, as before.
-        result: Any = runner_cls.run_sync(agent, manifest.prompt, **run_sync_kwargs)
-
-        # [DEEPSEEK-DEBUG] Unconditional post-call diagnostic: dump as much
-        # of the raw SDK response shape as is discoverable so an empty
-        # completion (zero usage, empty summary) or a malformed-tool-call
-        # response is a direct log read instead of a re-run-and-guess.
-        try:
-            _raw_responses = getattr(result, "raw_responses", None) or []
-            _raw_summaries: list[dict[str, Any]] = []
-            for _rr in _raw_responses:
-                _rr_usage = getattr(_rr, "usage", None)
-                _output = getattr(_rr, "output", None)
-                _choices = getattr(_rr, "choices", None)
-                _summary: dict[str, Any] = {
-                    "usage": {
-                        "input_tokens": getattr(_rr_usage, "input_tokens", None),
-                        "output_tokens": getattr(_rr_usage, "output_tokens", None),
-                        "raw": str(_rr_usage) if _rr_usage is not None else None,
-                    },
+            result: Any = run_council(agent, manifest.prompt, manifest.council, manifest)
+        else:
+            # [DEEPSEEK-DEBUG] Unconditional (not gated behind a debug flag)
+            # pre-call diagnostic for the deepseek/deepseek-chat-via-OpenRouter
+            # empty-completion / malformed-tool-call investigation (2026-07-03).
+            # Logged at INFO so it is captured on every run without operator
+            # opt-in. Never logs the API key itself - only the env var NAME.
+            _model_settings_obj = agent_kwargs.get("model_settings")
+            _model_settings_repr = (
+                {
+                    "temperature": getattr(_model_settings_obj, "temperature", None),
+                    "top_p": getattr(_model_settings_obj, "top_p", None),
+                    "tool_choice": getattr(_model_settings_obj, "tool_choice", None),
+                    "parallel_tool_calls": getattr(_model_settings_obj, "parallel_tool_calls", None),
+                    "max_tokens": getattr(_model_settings_obj, "max_tokens", None),
+                    "extra_args": getattr(_model_settings_obj, "extra_args", None),
+                    # extra_headers/extra_body are the SDK-conventional home for
+                    # provider auth (Authorization/api-key). Log only the KEY NAMES,
+                    # never the values, so this diagnostic can never leak a secret
+                    # if an auth header is ever configured here.
+                    "extra_headers_keys": _redacted_keys(getattr(_model_settings_obj, "extra_headers", None)),
+                    "extra_body_keys": _redacted_keys(getattr(_model_settings_obj, "extra_body", None)),
                 }
-                if _choices is not None:
-                    _choice_summaries = []
-                    for _choice in _choices:
-                        _message = getattr(_choice, "message", None)
-                        _choice_summaries.append(
-                            {
-                                "finish_reason": getattr(_choice, "finish_reason", None),
-                                "content": getattr(_message, "content", None) if _message else None,
-                                "refusal": getattr(_message, "refusal", None) if _message else None,
-                                "tool_calls": str(getattr(_message, "tool_calls", None)) if _message else None,
-                            },
-                        )
-                    _summary["choices"] = _choice_summaries
-                if _output is not None:
-                    _summary["output"] = str(_output)[:4000]
-                _raw_summaries.append(_summary)
+                if _model_settings_obj is not None
+                else "<no ModelSettings constructed - settings_kwargs was empty>"
+            )
+            _tool_list_for_log = agent_kwargs.get("tools", [])
+            # Only the NAME of the credential environment variable is logged here,
+            # never the secret value it resolves to.
+            _key_env_name_for_log = manifest.api_key_env
             logger.info(
-                "[DEEPSEEK-DEBUG] post-call session=%s model=%s raw_responses_count=%d "
-                "final_output=%r raw_responses=%s",
+                "[DEEPSEEK-DEBUG] pre-call session=%s model=%r base_url=%r api_key_env=%r "
+                "explicit_model_client=%s tool_source=%r tool_count=%d max_turns=%s",
                 manifest.session_id,
                 manifest.model,
-                len(_raw_responses),
-                str(getattr(result, "final_output", ""))[:2000],
-                json.dumps(_raw_summaries, default=str)[:8000],
+                manifest.base_url,
+                _key_env_name_for_log,
+                explicit_model_client is not None,
+                manifest.tool_source,
+                len(_tool_list_for_log),
+                max_turns,
             )
-            _result_usage = getattr(result, "usage", None)
             logger.info(
-                "[DEEPSEEK-DEBUG] post-call session=%s result.usage=%r "
-                "(RunResult/RunResultBase does not define 'usage' on installed SDK "
-                "0.17.7 per _extract_usage_tokens's docstring - expect None here; "
-                "the raw_responses per-call usage above is the real signal)",
+                "[DEEPSEEK-DEBUG] pre-call session=%s model_settings=%s "
+                "(tool_choice/parallel_tool_calls of None means the SDK/provider "
+                "default applies - bernstein never sets these explicitly)",
                 manifest.session_id,
-                _result_usage,
+                _model_settings_repr,
             )
-        except Exception as exc:  # diagnostics only - never mask the real failure
-            logger.warning(
-                "[DEEPSEEK-DEBUG] post-call session=%s: raw response logging itself "
-                "failed (SDK shape may differ from expected): %s: %s",
+            logger.info(
+                "[DEEPSEEK-DEBUG] pre-call session=%s no extra_headers configured by bernstein "
+                "(no HTTP-Referer/X-Title sent to OpenRouter unless the SDK's own default "
+                "HEADERS constant includes them) - client_kwargs base_url=%r",
                 manifest.session_id,
-                type(exc).__name__,
-                exc,
+                client_kwargs.get("base_url"),
             )
+            try:
+                _tool_schema_summary = _deepseek_debug_tool_schema_summary(_tool_list_for_log)
+                logger.info(
+                    "[DEEPSEEK-DEBUG] pre-call session=%s tool_schemas=%s",
+                    manifest.session_id,
+                    json.dumps(_tool_schema_summary, default=str)[:8000],
+                )
+                _any_strict_true = any(entry.get("strict_json_schema") is True for entry in _tool_schema_summary)
+                if _any_strict_true:
+                    logger.warning(
+                        "[DEEPSEEK-DEBUG] pre-call session=%s: at least one tool schema has "
+                        "strict_json_schema=True - the OpenAI Agents SDK sends this as "
+                        "'strict': true in the ChatCompletionToolParam.function block "
+                        "(agents/models/chatcmpl_converter.py Converter.tool_to_openai). "
+                        "This is the leading hypothesis for deepseek-chat-via-OpenRouter "
+                        "empty/malformed tool_calls - deepseek's function calling is not "
+                        "confirmed to fully support OpenAI's strict structured-output mode.",
+                        manifest.session_id,
+                    )
+            except Exception as exc:  # diagnostics only - never mask the real failure
+                logger.warning(
+                    "[DEEPSEEK-DEBUG] pre-call session=%s: tool schema logging itself failed: %s: %s",
+                    manifest.session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+            # ``Runner.run_sync`` is the SDK's synchronous API - we avoid
+            # ``asyncio.run`` here so the runner stays compatible with
+            # environments where the event loop is already running
+            # (e.g. pytest-asyncio tests that import this module). ``max_turns``
+            # is only forwarded when configured (env/tuning) - omitting the
+            # kwarg preserves the SDK's own default exactly, as before.
+            result = runner_cls.run_sync(agent, manifest.prompt, **run_sync_kwargs)
+
+            # [DEEPSEEK-DEBUG] Unconditional post-call diagnostic: dump as much
+            # of the raw SDK response shape as is discoverable so an empty
+            # completion (zero usage, empty summary) or a malformed-tool-call
+            # response is a direct log read instead of a re-run-and-guess.
+            try:
+                _raw_responses = getattr(result, "raw_responses", None) or []
+                _raw_summaries: list[dict[str, Any]] = []
+                for _rr in _raw_responses:
+                    _rr_usage = getattr(_rr, "usage", None)
+                    _output = getattr(_rr, "output", None)
+                    _choices = getattr(_rr, "choices", None)
+                    _summary: dict[str, Any] = {
+                        "usage": {
+                            "input_tokens": getattr(_rr_usage, "input_tokens", None),
+                            "output_tokens": getattr(_rr_usage, "output_tokens", None),
+                            "raw": str(_rr_usage) if _rr_usage is not None else None,
+                        },
+                    }
+                    if _choices is not None:
+                        _choice_summaries = []
+                        for _choice in _choices:
+                            _message = getattr(_choice, "message", None)
+                            _choice_summaries.append(
+                                {
+                                    "finish_reason": getattr(_choice, "finish_reason", None),
+                                    "content": getattr(_message, "content", None) if _message else None,
+                                    "refusal": getattr(_message, "refusal", None) if _message else None,
+                                    "tool_calls": str(getattr(_message, "tool_calls", None)) if _message else None,
+                                },
+                            )
+                        _summary["choices"] = _choice_summaries
+                    if _output is not None:
+                        _summary["output"] = str(_output)[:4000]
+                    _raw_summaries.append(_summary)
+                logger.info(
+                    "[DEEPSEEK-DEBUG] post-call session=%s model=%s raw_responses_count=%d "
+                    "final_output=%r raw_responses=%s",
+                    manifest.session_id,
+                    manifest.model,
+                    len(_raw_responses),
+                    str(getattr(result, "final_output", ""))[:2000],
+                    json.dumps(_raw_summaries, default=str)[:8000],
+                )
+                _result_usage = getattr(result, "usage", None)
+                logger.info(
+                    "[DEEPSEEK-DEBUG] post-call session=%s result.usage=%r "
+                    "(RunResult/RunResultBase does not define 'usage' on installed SDK "
+                    "0.17.7 per _extract_usage_tokens's docstring - expect None here; "
+                    "the raw_responses per-call usage above is the real signal)",
+                    manifest.session_id,
+                    _result_usage,
+                )
+            except Exception as exc:  # diagnostics only - never mask the real failure
+                logger.warning(
+                    "[DEEPSEEK-DEBUG] post-call session=%s: raw response logging itself "
+                    "failed (SDK shape may differ from expected): %s: %s",
+                    manifest.session_id,
+                    type(exc).__name__,
+                    exc,
+                )
     except Exception as exc:  # SDK errors are varied - catch broadly
         # D2 MiniMax attempt-3 (2026-07-03): agents that die on an
         # exception - especially ``MaxTurnsExceeded``, which by definition
