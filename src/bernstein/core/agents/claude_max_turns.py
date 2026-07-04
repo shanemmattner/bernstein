@@ -118,16 +118,39 @@ def compute_max_turns(
         MaxTurnsConfig with the computed (or explicit) value and reasoning.
     """
     if explicit_max_turns is not None:
-        logger.info("max_turns=%s (explicit)", explicit_max_turns)
+        # min_turns/max_turns_cap are documented as ABSOLUTE bounds (see the
+        # Args docstring above) - the explicit-override path must not be able
+        # to defeat them. Clamp the same way the computed path does below
+        # (`max(min_turns, min(turns, max_turns_cap))`) so a caller-supplied
+        # 100000 can't blow the cost ceiling and a caller-supplied 0/negative
+        # can't break the agent's first turn.
+        clamped_max_turns = max(min_turns, min(explicit_max_turns, max_turns_cap))
+        if clamped_max_turns != explicit_max_turns:
+            logger.warning(
+                "max_turns=%s (explicit override clamped to %s; absolute bounds are "
+                "min_turns=%s, max_turns_cap=%s)",
+                explicit_max_turns,
+                clamped_max_turns,
+                min_turns,
+                max_turns_cap,
+            )
+        else:
+            logger.info("max_turns=%s (explicit)", explicit_max_turns)
         return MaxTurnsConfig(
-            max_turns=explicit_max_turns,
+            max_turns=clamped_max_turns,
             complexity=complexity,
             model=model,
             timeout_s=timeout_s,
             turns_per_minute=_TURNS_PER_MINUTE.get(_classify_model_tier(model), DEFAULT_TURNS_PER_MINUTE),
             constrained_by_timeout=False,
             reasoning=(
-                f"Explicit max_turns={explicit_max_turns} supplied by caller; complexity-based computation bypassed."
+                f"Explicit max_turns={explicit_max_turns} supplied by caller; complexity-based computation "
+                f"bypassed, clamped to absolute bounds [{min_turns}, {max_turns_cap}] -> {clamped_max_turns}."
+                if clamped_max_turns != explicit_max_turns
+                else (
+                    f"Explicit max_turns={explicit_max_turns} supplied by caller; "
+                    "complexity-based computation bypassed."
+                )
             ),
         )
 
