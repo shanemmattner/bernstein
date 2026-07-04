@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import time
 from contextlib import suppress
@@ -263,7 +264,12 @@ def _is_auto_commit_denied(path: str) -> bool:
             stem = glob[:-2]
             if p == stem or p.startswith(stem + "."):
                 return True
-        elif glob in p:
+        # Exact basename/path match rather than substring containment --
+        # substring containment (``glob in p``) would also match unrelated
+        # paths that merely contain ".env" somewhere, e.g. ".envrc" or
+        # "config.envelope.json", silently excluding legitimate files from
+        # auto-commit.
+        elif p == glob or os.path.basename(p) == glob:
             return True
     return False
 
