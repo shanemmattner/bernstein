@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from bernstein.core.agency_loader import AgencyAgent
+from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
 from bernstein.core.models import (
     AgentSession,
     Complexity,
@@ -312,11 +313,14 @@ class TestSelectBatchConfig:
         assert config.effort == "max"
 
     def test_single_task_returns_its_config(self, make_task) -> None:
-        # LOW+SMALL tasks hit the L1 fast-path → cheapest model (haiku/low)
+        # LOW+SMALL tasks hit the L1 fast-path, which requires
+        # fast_path.l1_model to be configured via routing.yaml. Bernstein
+        # never hardcodes a fallback model (previously "sonnet") - with no
+        # config loaded, this must hard-fail with a clear error instead of
+        # silently defaulting.
         task = make_task(complexity=Complexity.LOW, scope=Scope.SMALL)
-        config = _select_batch_config([task])
-        assert config.model == "sonnet"
-        assert config.effort == "normal"
+        with pytest.raises(ModelNotConfiguredError, match="No L1 model configured"):
+            _select_batch_config([task])
 
 
 # --- TierAwareRouter integration ---

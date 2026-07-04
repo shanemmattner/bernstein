@@ -15,6 +15,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from bernstein.core.agents.spawn_errors import ModelNotConfiguredError
@@ -22,8 +23,6 @@ from bernstein.core.models import Complexity, ModelConfig, Scope, Task
 from bernstein.core.routing.router_policies import ModelPolicy, PolicyFilter
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from bernstein.core.quota_probe import QuotaSnapshot
 
 logger = logging.getLogger(__name__)
@@ -1086,7 +1085,19 @@ def _try_bandit_selection(
         bandit = EpsilonGreedyBandit.load(bandit_metrics_dir)
         _seed_bandit_with_effectiveness(bandit, task, workdir, bandit_metrics_dir)
 
-        candidates = ["sonnet", "opus"] if task.complexity == Complexity.HIGH else list(CASCADE)
+        # Bandit arms are Claude tier names (haiku/sonnet/opus) - this path only
+        # ever runs for the Claude-compatible bandit/cascade routing scheme, so
+        # tier names are the correct vocabulary here (see spawner_core.py's
+        # retry-escalation comments for the same convention). The single
+        # source of truth for the arm set is CASCADE (bernstein.core.cost),
+        # not a re-hardcoded literal - both branches previously duplicated
+        # CASCADE's exact contents (["sonnet", "opus"]), so the HIGH-complexity
+        # special case was dead code; using CASCADE directly for all
+        # complexities removes the redundant hardcoded literal while keeping
+        # this Claude-adapter-specific behavior intact. Operators who need a
+        # different arm set configure it via CASCADE/cost.py, not by patching
+        # this call site.
+        candidates = list(CASCADE)
         selected = bandit.select(role=task.role, candidate_models=candidates)
         effort = "max" if selected == "opus" else "high"
         logger.info(
@@ -1453,10 +1464,36 @@ _default_router: TierAwareRouter | None = None
 
 
 def get_default_router() -> TierAwareRouter:
-    """Get or create the default router instance with pre-configured providers."""
+    """Get or create the default router instance with pre-configured providers.
+
+    Prefers ``<cwd>/.sdd/config/providers.yaml`` (the same convention used by
+    the orchestrator/server/CLI entry points) over the hardcoded example
+    catalog below. The hardcoded catalog only exists as a documented,
+    clearly-logged last resort for callers (e.g. ``hijacker.py``'s
+    ``router or get_default_router()`` fallback) that construct a router with
+    no workdir/config context at all - it is never used silently when a real
+    providers.yaml is present.
+    """
     global _default_router
     if _default_router is None:
         _default_router = TierAwareRouter()
+
+        providers_yaml = Path.cwd() / ".sdd" / "config" / "providers.yaml"
+        if providers_yaml.exists():
+            logger.info(
+                "get_default_router: loading config-supplied providers from %s",
+                providers_yaml,
+            )
+            load_providers_from_yaml(providers_yaml, _default_router)
+            return _default_router
+
+        logger.warning(
+            "get_default_router: no providers.yaml found at %s - falling back to "
+            "the built-in example provider catalog (openrouter_free/anthropic_standard/"
+            "anthropic_premium/google_ai). Configure .sdd/config/providers.yaml to "
+            "override these hardcoded example models/tiers.",
+            providers_yaml,
+        )
 
         # Free tier provider (e.g., OpenRouter free models)
         _default_router.register_provider(
