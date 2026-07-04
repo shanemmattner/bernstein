@@ -1,0 +1,76 @@
+# Dockerfile.run — per-RUN container image for the Docker isolation model.
+#
+# See design doc: work/bernstein/docker-isolation-design.md
+#
+# Unlike the production Dockerfile (all-in-one server image), this image is
+# built once and reused across dozens of parallel `docker run` invocations —
+# one container per run, launched by bernstein.core.docker_runner.DockerRunner.
+# The repo worktree, .sdd/runs/<run-id>/ dir, bernstein.yaml seed, and secrets
+# are all injected at `docker run` time via bind mounts / --env-file, never
+# baked into this image (see design doc §6, §5).
+#
+# Layer order: wheel build -> apt deps -> pip install wheel -> user/dirs.
+# Everything above is cacheable across runs; only mounts/env differ per run.
+
+# Stage 1: build the bernstein wheel
+# python:3.13-slim
+FROM python:3.13-slim@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280 AS build
+
+WORKDIR /app
+COPY . /app
+
+RUN pip install --no-cache-dir hatchling==1.29.0 && \
+    python -m hatchling build
+
+# Stage 2: runtime
+# python:3.13-slim
+FROM python:3.13-slim@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280
+
+LABEL org.opencontainers.image.title="bernstein-run" \
+      org.opencontainers.image.description="Per-run isolated container image for Bernstein orchestration" \
+      org.opencontainers.image.source="https://github.com/bernstein-ai/bernstein"
+
+# Install git (required for git_ops / worktree commits), curl (healthcheck),
+# build-essential (many agent tasks compile native extensions), and
+# nodejs/npm (many agent tasks run JS/TS toolchains). Scope is deliberately
+# limited to what the agent fleet commonly invokes (design doc §6) — add more
+# only when a real run demonstrates the need.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    build-essential \
+    nodejs \
+    npm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY --from=build /app/dist/*.whl /tmp/
+
+RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl && \
+    useradd -m -u 1000 bernstein && chown bernstein:bernstein /workspace
+
+USER bernstein
+
+# The bind-mounted worktree at /workspace is owned by the *host* UID, which
+# will not match the container's bernstein (UID 1000) user in most cases.
+# Without this, git refuses to operate on it ("detected dubious ownership").
+RUN git config --global --add safe.directory /workspace
+
+# Bernstein state directory (mount .sdd/runs/<run-id>/ here at `docker run`
+# time; see docker_runner.py and the design doc's Volume Mount Strategy table)
+VOLUME ["/workspace/.sdd"]
+
+# Task server HTTP + gRPC ports (actual host<->container port is chosen per
+# run and published with -p <port>:<port> by the orchestrator; see
+# DockerRunner.find_available_port)
+EXPOSE 8052 50051
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl --fail --silent --show-error http://127.0.0.1:8052/health || exit 1
+
+# Default command — the orchestrator overrides this at `docker run` time with
+# the full per-run command, e.g.:
+#   bernstein conduct --run-id <run-id> --auto-approve --quiet
+ENTRYPOINT ["bernstein"]
+CMD ["conduct"]
