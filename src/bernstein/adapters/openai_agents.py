@@ -345,11 +345,23 @@ class OpenAIAgentsAdapter(PluginAdapter):
         if isinstance(raw_allow, bool):
             allow_run_command = raw_allow
         else:
+            if raw_allow is not None:
+                logger.warning(
+                    "mcp_config allow_run_command=%r must be a bool; falling back to env %s",
+                    raw_allow,
+                    _ALLOW_RUN_COMMAND_ENV_VAR,
+                )
             allow_run_command = os.environ.get(_ALLOW_RUN_COMMAND_ENV_VAR) == "1"
         raw_max_turns = (mcp_config or {}).get("max_turns")
         if isinstance(raw_max_turns, int) and not isinstance(raw_max_turns, bool) and raw_max_turns > 0:
             max_turns: int | None = raw_max_turns
         else:
+            if raw_max_turns is not None:
+                logger.warning(
+                    "mcp_config max_turns=%r must be a positive int; falling back to "
+                    "env/tuning.agent.max_turns/SDK default",
+                    raw_max_turns,
+                )
             # Spawn-side resolution of env > tuning.agent.max_turns > None,
             # reusing the runner's own resolver (in this process the env is
             # the parent env and defaults are the yaml-loaded tuning).
