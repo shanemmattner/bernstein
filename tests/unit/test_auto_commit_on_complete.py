@@ -46,6 +46,7 @@ from bernstein.core.tasks.models import Task, TaskStatus
         ".env",
         ".env.local",
         ".env.production",
+        "config/.env",
     ],
 )
 def test_is_auto_commit_denied_true(path: str) -> None:
@@ -60,6 +61,13 @@ def test_is_auto_commit_denied_true(path: str) -> None:
         "templates/roles/backend/system_prompt.md",
         "README.md",
         "docs/operations/runbook.md",
+        # Regression: plain substring containment on ".env" previously
+        # matched any path that merely contains the substring ".env"
+        # anywhere, silently excluding unrelated legitimate files from
+        # auto-commit.
+        ".envrc",
+        "config.envelope.json",
+        "src/bernstein/core/envelope.py",
     ],
 )
 def test_is_auto_commit_denied_false(path: str) -> None:
