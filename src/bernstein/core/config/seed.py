@@ -391,3 +391,54 @@ def build_config_snapshot(
         feature_gates=registry.to_snapshot(),
         stale_gate_names=stale,
     )
+
+
+# ---------------------------------------------------------------------------
+# Seed path resolution (fixes: subprocesses losing role_model_policy because
+# they independently re-derived ``workdir / "bernstein.yaml"`` instead of
+# using the path the bootstrap process actually parsed)
+# ---------------------------------------------------------------------------
+
+
+def resolve_seed_path(workdir: Path, explicit: Path | None = None) -> Path:
+    """Resolve the effective seed (bernstein.yaml) path for a process.
+
+    Every Bernstein subprocess (spawner/orchestrator, watchdog, FastAPI
+    server) needs to agree on which seed file to parse. Historically each
+    subprocess independently hardcoded ``workdir / "bernstein.yaml"``, which
+    silently produced an empty/default config whenever the real seed lived
+    elsewhere (e.g. a non-default filename or a seed staged outside the
+    workdir) -- ``role_model_policy`` and other seed-driven settings were
+    lost with no error, and agents spawned with the default model instead
+    of the configured one.
+
+    Resolution order (highest priority first):
+        1. ``explicit`` -- an caller-supplied path (e.g. parsed from
+           ``--seed-path`` argv or threaded through from the bootstrap
+           process that already resolved it).
+        2. ``BERNSTEIN_SEED_PATH`` env var -- set by the bootstrap process
+           on the subprocess env so children inherit the resolved path
+           without needing their own argv plumbing.
+        3. Fallback: ``workdir / "bernstein.yaml"`` (the historical default).
+
+    Args:
+        workdir: Project root directory.
+        explicit: Explicit seed path override, if the caller already knows it.
+
+    Returns:
+        Resolved, absolute :class:`Path` to the seed file.
+    """
+    if explicit:
+        resolved = explicit.resolve()
+        logger.debug("resolve_seed_path: using explicit path %s", resolved)
+        return resolved
+
+    env_path = os.environ.get("BERNSTEIN_SEED_PATH", "").strip()
+    if env_path:
+        resolved = Path(env_path).resolve()
+        logger.debug("resolve_seed_path: using BERNSTEIN_SEED_PATH=%s -> %s", env_path, resolved)
+        return resolved
+
+    resolved = (workdir / "bernstein.yaml").resolve()
+    logger.debug("resolve_seed_path: falling back to workdir default %s", resolved)
+    return resolved
