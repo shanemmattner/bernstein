@@ -700,6 +700,42 @@ class SQLiteInstrumenterBackend(InstrumenterBackend):
                 sanitize_log(self.task_id),
                 sanitize_log(self.agent_id),
             )
+            # Bug fix (2026-07-04, see work/bernstein/sqlite-analysis-scripts.md
+            # §2): run_meta was created by the schema but never populated by
+            # any write path, so every real run.db observed had zero rows in
+            # run_meta - run/task/agent identity had to be inferred from the
+            # directory path instead of read directly. Populate it here, once
+            # per connection, immediately after schema creation.
+            try:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO run_meta (key, value) VALUES (?, ?)",
+                    (
+                        ("run_id", self.run_id),
+                        ("task_id", self.task_id),
+                        ("agent_id", self.agent_id),
+                    ),
+                )
+                conn.commit()
+                logger.info(
+                    "SQLiteInstrumenterBackend: populated run_meta in %s with run_id=%s "
+                    "task_id=%s agent_id=%s",
+                    db_path,
+                    self.run_id,
+                    self.task_id,
+                    self.agent_id,
+                )
+            except sqlite3.Error:
+                logger.warning(
+                    "SQLiteInstrumenterBackend: failed to populate run_meta in %s (run_id=%s "
+                    "task_id=%s agent_id=%s) - run_meta will remain empty for this db, identity "
+                    "must still be inferred from the directory path; the agent run itself is "
+                    "unaffected",
+                    db_path,
+                    self.run_id,
+                    self.task_id,
+                    self.agent_id,
+                    exc_info=True,
+                )
         except sqlite3.Error:
             logger.warning(
                 "SQLiteInstrumenterBackend: failed to open/create %s (run_id=%s task_id=%s agent_id=%s) - "
