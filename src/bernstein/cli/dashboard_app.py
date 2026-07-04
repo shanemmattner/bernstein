@@ -1186,6 +1186,9 @@ class BernsteinApp(App[None]):
             SDD_PID_WATCHDOG,
             is_alive,
             read_pid,
+            sdd_pid_server,
+            sdd_pid_spawner,
+            sdd_pid_watchdog,
         )
         from bernstein.core.platform_compat import kill_process
 
@@ -1202,8 +1205,16 @@ class BernsteinApp(App[None]):
                 headers=_shutdown_headers,
             )
 
+        # PID files moved from a flat .sdd/runtime/ layout to
+        # .sdd/runtime/<port>/ (see get_runtime_dir); check both the
+        # namespaced path for this dashboard's server port and the legacy
+        # flat path, in case this dashboard is attached to a pre-upgrade run.
+        server_pid_paths = (sdd_pid_server(), SDD_PID_SERVER)
+        spawner_pid_paths = (sdd_pid_spawner(), SDD_PID_SPAWNER)
+        watchdog_pid_paths = (sdd_pid_watchdog(), SDD_PID_WATCHDOG)
+
         # 2. Kill spawner and watchdog
-        for pid_path in (SDD_PID_SPAWNER, SDD_PID_WATCHDOG):
+        for pid_path in (*spawner_pid_paths, *watchdog_pid_paths):
             pid = read_pid(pid_path)
             if pid is not None and is_alive(pid):
                 kill_process(pid, sig=_signal.SIGTERM)
@@ -1212,12 +1223,13 @@ class BernsteinApp(App[None]):
         import time as _time
 
         _time.sleep(0.5)
-        server_pid = read_pid(SDD_PID_SERVER)
-        if server_pid is not None and is_alive(server_pid):
-            kill_process(server_pid, sig=_signal.SIGKILL)
+        for pid_path in server_pid_paths:
+            server_pid = read_pid(pid_path)
+            if server_pid is not None and is_alive(server_pid):
+                kill_process(server_pid, sig=_signal.SIGKILL)
 
         # 4. Clean up PID files so the next run starts fresh
-        for pid_path in (SDD_PID_SERVER, SDD_PID_SPAWNER, SDD_PID_WATCHDOG):
+        for pid_path in (*server_pid_paths, *spawner_pid_paths, *watchdog_pid_paths):
             Path(pid_path).unlink(missing_ok=True)
 
     def action_hot_restart(self) -> None:

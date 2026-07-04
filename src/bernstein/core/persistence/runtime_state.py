@@ -120,17 +120,64 @@ def rotate_log_file(
         return False
 
 
-def write_supervisor_state(workdir: Path, snapshot: SupervisorStateSnapshot) -> Path:
-    """Persist the current supervisor snapshot under ``.sdd/runtime``."""
-    runtime_dir = workdir / ".sdd" / "runtime"
+def get_runtime_dir(workdir: Path, port: int) -> Path:
+    """Return the per-port namespaced runtime directory, creating it if needed.
+
+    Bernstein namespaces all per-instance runtime state (PID files, server/
+    spawner/watchdog logs, the singleton lock file, supervisor state) under
+    ``.sdd/runtime/<port>/`` instead of a single flat ``.sdd/runtime/``
+    directory, so multiple Bernstein runs can execute concurrently against
+    the same repo without one instance's PID files / logs clobbering
+    another's. The single-run default case is unaffected in spirit: with no
+    explicit ``--port``/``--auto-port``, every caller still resolves to port
+    8052, which simply means the namespaced directory is
+    ``.sdd/runtime/8052/`` instead of the old flat ``.sdd/runtime/``.
+
+    See :mod:`bernstein.core.port_alloc` for how *port* itself is resolved
+    (explicit ``--port``, auto-assigned from a configurable range, or the
+    8052 default).
+
+    Args:
+        workdir: Project root directory.
+        port: The TCP port this Bernstein instance is bound to.
+
+    Returns:
+        ``workdir / ".sdd" / "runtime" / str(port)``, created if missing.
+    """
+    runtime_dir = workdir / ".sdd" / "runtime" / str(port)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    logger.debug("get_runtime_dir: port=%d -> %s", port, runtime_dir)
+    return runtime_dir
+
+
+def write_supervisor_state(workdir: Path, snapshot: SupervisorStateSnapshot, port: int | None = None) -> Path:
+    """Persist the current supervisor snapshot under ``.sdd/runtime``.
+
+    Args:
+        workdir: Project root directory.
+        snapshot: Supervisor state to persist.
+        port: When given, namespaces the write under
+            ``.sdd/runtime/<port>/`` (see :func:`get_runtime_dir`). When
+            ``None`` (legacy callers not yet updated), falls back to the
+            flat ``.sdd/runtime/`` layout for back-compat.
+    """
+    runtime_dir = get_runtime_dir(workdir, port) if port is not None else workdir / ".sdd" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
     path = runtime_dir / _SUPERVISOR_STATE_FILE
     write_atomic_json(path, snapshot.to_dict())
     return path
 
 
-def read_supervisor_state(sdd_dir: Path) -> SupervisorStateSnapshot | None:
-    """Load the latest supervisor snapshot from disk."""
-    path = sdd_dir / "runtime" / _SUPERVISOR_STATE_FILE
+def read_supervisor_state(sdd_dir: Path, port: int | None = None) -> SupervisorStateSnapshot | None:
+    """Load the latest supervisor snapshot from disk.
+
+    Args:
+        sdd_dir: The project's ``.sdd`` directory.
+        port: When given, reads from the namespaced ``runtime/<port>/``
+            directory; when ``None``, reads the legacy flat location.
+    """
+    runtime_dir = (sdd_dir / "runtime" / str(port)) if port is not None else (sdd_dir / "runtime")
+    path = runtime_dir / _SUPERVISOR_STATE_FILE
     if not path.exists():
         return None
     try:

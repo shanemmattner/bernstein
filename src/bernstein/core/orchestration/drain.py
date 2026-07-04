@@ -246,10 +246,17 @@ class DrainCoordinator:
         workdir: Path,
         server_url: str = "http://127.0.0.1:8052",
         config: DrainConfig | None = None,
+        port: int | None = None,
     ) -> None:
         self._workdir = workdir
         self._server_url = server_url
         self._config = config or DrainConfig()
+        # PID files / supervisor state moved from a flat .sdd/runtime/ layout
+        # to .sdd/runtime/<port>/ so concurrent Bernstein runs don't clobber
+        # each other's state (see bernstein.core.persistence.runtime_state
+        # .get_runtime_dir). Derive the port from server_url when not given
+        # explicitly, falling back to the historical default 8052.
+        self._port = port if port is not None else self._parse_port_from_url(server_url)
 
         self._phases = self._build_phases()
         self._agents: list[AgentDrainStatus] = []
@@ -869,6 +876,17 @@ class DrainCoordinator:
             except OSError as exc:
                 logger.warning("Failed to move ticket %s: %s", ticket_path.name, exc)
 
+    @staticmethod
+    def _parse_port_from_url(server_url: str) -> int:
+        """Best-effort extraction of the TCP port from a server URL, default 8052."""
+        from urllib.parse import urlparse
+
+        with contextlib.suppress(ValueError):
+            parsed = urlparse(server_url)
+            if parsed.port:
+                return parsed.port
+        return 8052
+
     async def _stop_infrastructure(self) -> None:
         """Terminate the watchdog, spawner, and server for this run."""
         await self._terminate_runtime_pid("watchdog.pid", "watchdog")
@@ -876,12 +894,15 @@ class DrainCoordinator:
 
         server_pid = self._read_runtime_pid("server.pid")
         if server_pid is None:
-            snapshot = read_supervisor_state(self._workdir / ".sdd")
+            snapshot = read_supervisor_state(self._workdir / ".sdd", port=self._port)
+            if snapshot is None:
+                # Legacy fallback: pre-namespacing runs wrote the flat path.
+                snapshot = read_supervisor_state(self._workdir / ".sdd")
             if snapshot is not None and snapshot.current_pid > 0:
                 server_pid = snapshot.current_pid
         # Fallback: find server by port if PID file missing
         if server_pid is None:
-            server_pid = self._find_pid_by_port(8052)
+            server_pid = self._find_pid_by_port(self._port)
             if server_pid:
                 logger.debug("Found task server by port scan: PID %d", server_pid)
         await self._terminate_process(server_pid, "task server")
@@ -937,14 +958,22 @@ class DrainCoordinator:
         return None
 
     def _read_runtime_pid(self, filename: str) -> int | None:
-        """Read a runtime PID file, returning None for missing or invalid data."""
-        pid_path = self._workdir / ".sdd" / "runtime" / filename
-        if not pid_path.exists():
-            return None
-        try:
-            return int(pid_path.read_text(encoding="utf-8").strip())
-        except ValueError:
-            return None
+        """Read a runtime PID file, returning None for missing or invalid data.
+
+        Checks the port-namespaced location first (``.sdd/runtime/<port>/``)
+        and falls back to the legacy flat ``.sdd/runtime/`` path so drain
+        still works against a run started before port-namespacing shipped.
+        """
+        namespaced = self._workdir / ".sdd" / "runtime" / str(self._port) / filename
+        legacy = self._workdir / ".sdd" / "runtime" / filename
+        for pid_path in (namespaced, legacy):
+            if not pid_path.exists():
+                continue
+            try:
+                return int(pid_path.read_text(encoding="utf-8").strip())
+            except ValueError:
+                return None
+        return None
 
     async def _terminate_runtime_pid(self, filename: str, label: str) -> None:
         """Terminate a runtime-managed process named by *filename*."""
@@ -988,10 +1017,18 @@ class DrainCoordinator:
         if signals_dir.exists():
             shutil.rmtree(signals_dir, ignore_errors=True)
 
-        # Remove PID files.
+        # Remove PID files (legacy flat layout, if any remain).
         for pid_file in runtime_dir.glob("*.pid"):
             pid_file.unlink(missing_ok=True)
 
         # Remove other shutdown coordination artifacts from the finished run.
         (runtime_dir / "draining").unlink(missing_ok=True)
         (runtime_dir / "supervisor_state.json").unlink(missing_ok=True)
+
+        # Namespaced runtime dir for this instance's port (PID files, logs,
+        # supervisor state, singleton lock). See get_runtime_dir().
+        port_dir = runtime_dir / str(self._port)
+        if port_dir.exists():
+            for pid_file in port_dir.glob("*.pid"):
+                pid_file.unlink(missing_ok=True)
+            (port_dir / "supervisor_state.json").unlink(missing_ok=True)

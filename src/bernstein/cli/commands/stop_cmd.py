@@ -27,6 +27,9 @@ from bernstein.cli.helpers import (
     kill_pid_hard,
     print_banner,
     read_pid,
+    sdd_pid_server,
+    sdd_pid_spawner,
+    sdd_pid_watchdog,
     sigkill_pid,
 )
 from bernstein.core.observability.icons import get_icons
@@ -36,6 +39,44 @@ from bernstein.core.runtime_state import read_supervisor_state
 _LABEL_TASK_SERVER = "Task server"
 _AGENTS_JSON_PATH = ".sdd/runtime/agents.json"
 _YAML_GLOB = "*.yaml"
+_RUNTIME_ROOT = Path(".sdd/runtime")
+
+
+def _discover_namespaced_ports() -> list[int]:
+    """Return the ports of every ``.sdd/runtime/<port>/`` directory on disk.
+
+    Used by a bare ``bernstein stop`` (no ``--port``) to sweep every locally
+    running namespaced instance, matching the pre-namespacing "stop
+    everything" semantics of a flat single-instance layout.
+    """
+    if not _RUNTIME_ROOT.is_dir():
+        return []
+    ports: list[int] = []
+    for child in _RUNTIME_ROOT.iterdir():
+        if child.is_dir() and child.name.isdigit():
+            ports.append(int(child.name))
+    return sorted(ports)
+
+
+def _resolve_stop_targets(explicit_port: int | None) -> list[int | None]:
+    """Resolve which port(s) ``bernstein stop`` should target.
+
+    ``None`` in the returned list means "the legacy flat ``.sdd/runtime/``
+    layout" (pre-namespacing runs). Precedence:
+
+    1. Explicit ``--port``: target only that port.
+    2. No ``--port``: target the legacy flat layout, the default port 8052
+       (the namespaced location a plain ``bernstein run`` now uses), and any
+       other namespaced port directories found on disk -- so a bare
+       ``bernstein stop`` still cleans up every locally running instance.
+    """
+    if explicit_port is not None:
+        return [explicit_port]
+    targets: list[int | None] = [None, 8052]
+    for port in _discover_namespaced_ports():
+        if port not in targets:
+            targets.append(port)
+    return targets
 
 
 def stop_active_tunnels() -> int:
@@ -293,11 +334,16 @@ def _format_agent_status_line(agents: object, icons: object) -> str | None:
     return " | ".join(parts) if parts else None
 
 
-def soft_stop(timeout: int) -> None:
+def soft_stop(timeout: int, port: int | None = None) -> None:
     """Graceful drain via DrainCoordinator.
 
     Args:
         timeout: Maximum seconds to wait for agents to exit gracefully.
+        port: Namespaced instance port to drain. ``None`` lets
+            :class:`DrainCoordinator` derive the port from
+            ``BERNSTEIN_SERVER_URL`` (default 8052) -- soft-stop targets a
+            single instance at a time, unlike hard-stop's multi-port sweep,
+            since a graceful drain talks to one running server's HTTP API.
     """
     import asyncio
 
@@ -305,7 +351,8 @@ def soft_stop(timeout: int) -> None:
 
     workdir = Path.cwd()
     config = DrainConfig(wait_timeout_s=timeout)
-    coordinator = DrainCoordinator(workdir, config=config)
+    server_url = f"http://127.0.0.1:{port}" if port is not None else SERVER_URL
+    coordinator = DrainCoordinator(workdir, server_url=server_url, config=config, port=port)
 
     _last_phase: dict[str, int] = {"number": 0}
 
@@ -423,9 +470,15 @@ def _collect_pids_from_metadata(killed: set[int]) -> None:
         pid_file.unlink(missing_ok=True)
 
 
-def _collect_pids_from_supervisor_state(killed: set[int]) -> None:
-    """Source C: kill the server from supervisor state when pid files are missing."""
-    snapshot = read_supervisor_state(Path(".sdd"))
+def _collect_pids_from_supervisor_state(killed: set[int], port: int | None = None) -> None:
+    """Source C: kill the server from supervisor state when pid files are missing.
+
+    Args:
+        killed: Set of already-killed PIDs to update.
+        port: Namespaced runtime port to read supervisor state from. ``None``
+            reads the legacy flat ``.sdd/runtime/supervisor_state.json``.
+    """
+    snapshot = read_supervisor_state(Path(".sdd"), port=port)
     if snapshot is None or snapshot.current_pid <= 0:
         return
     if snapshot.current_pid not in killed and is_alive(snapshot.current_pid):
@@ -645,8 +698,15 @@ def _find_port_pids_unix(port: int) -> list[int]:
     return pids
 
 
-def _cleanup_runtime_artifacts() -> None:
-    """Remove stale PID files and agents.json so the next stop is clean."""
+def _cleanup_runtime_artifacts(target_ports: list[int | None] | None = None) -> None:
+    """Remove stale PID files and agents.json so the next stop is clean.
+
+    Args:
+        target_ports: Namespaced ports (plus ``None`` for the legacy flat
+            layout) whose PID files / lock file / supervisor state should be
+            removed. Defaults to just the legacy flat layout for back-compat
+            with any caller that hasn't been updated to pass targets.
+    """
     for path in (
         Path(_AGENTS_JSON_PATH),
         Path(".sdd/runtime/draining"),
@@ -666,9 +726,31 @@ def _cleanup_runtime_artifacts() -> None:
         for f in pids_dir.glob("*.json"):
             f.unlink(missing_ok=True)
 
+    # Namespaced per-port runtime dirs (PID files, singleton lock,
+    # supervisor state). agents.json/signals/pids are intentionally left
+    # untouched here -- they remain flat/shared until a follow-up migrates
+    # their write sites too (see task report for the full list).
+    for port in target_ports or ():
+        if port is None:
+            continue
+        port_dir = Path(".sdd/runtime") / str(port)
+        if not port_dir.is_dir():
+            continue
+        for name in ("bernstein.pid", "server.pid", "spawner.pid", "watchdog.pid", "supervisor_state.json"):
+            (port_dir / name).unlink(missing_ok=True)
 
-def hard_stop() -> None:
-    """Hard stop: SIGKILL everything, best-effort save, return tickets."""
+
+def hard_stop(port: int | None = None) -> None:
+    """Hard stop: SIGKILL everything, best-effort save, return tickets.
+
+    Args:
+        port: When given, only the Bernstein instance namespaced under
+            ``.sdd/runtime/<port>/`` is targeted. When ``None`` (default),
+            sweeps the legacy flat layout, the default port 8052, and every
+            other namespaced port directory found on disk -- preserving the
+            pre-namespacing "stop everything" behaviour of a bare
+            ``bernstein stop``.
+    """
     # 1. Best-effort session save while server is still alive
     try:
         save_session_on_stop(Path.cwd())
@@ -676,13 +758,24 @@ def hard_stop() -> None:
     except OSError:
         console.print("[yellow]Could not save session state.[/yellow]")
 
-    # 2. Kill infrastructure: watchdog, spawner, server
+    targets = _resolve_stop_targets(port)
+    logger_targets = ", ".join("flat" if t is None else str(t) for t in targets)
+    console.print(f"[dim]Stop targets: {logger_targets}[/dim]")
+
+    # 2. Kill infrastructure: watchdog, spawner, server (per target port).
+    # ``target is None`` means "legacy flat layout" -- use the flat
+    # constants directly rather than sdd_pid_*(None), which resolves to the
+    # *namespaced* env/default port path, a different thing entirely.
     killed_pids: set[int] = set()
-    _kill_pid_file(SDD_PID_WATCHDOG, "Watchdog", killed_pids)
-    _kill_pid_file(SDD_PID_SPAWNER, "Spawner", killed_pids)
-    _kill_pid_file(SDD_PID_SERVER, _LABEL_TASK_SERVER, killed_pids)
-    _collect_pids_from_supervisor_state(killed_pids)
-    _kill_port_holder(8052, killed_pids)  # last resort: kill whatever holds the port
+    for target in targets:
+        watchdog_path = SDD_PID_WATCHDOG if target is None else sdd_pid_watchdog(target)
+        spawner_path = SDD_PID_SPAWNER if target is None else sdd_pid_spawner(target)
+        server_path = SDD_PID_SERVER if target is None else sdd_pid_server(target)
+        _kill_pid_file(watchdog_path, "Watchdog", killed_pids)
+        _kill_pid_file(spawner_path, "Spawner", killed_pids)
+        _kill_pid_file(server_path, _LABEL_TASK_SERVER, killed_pids)
+        _collect_pids_from_supervisor_state(killed_pids, port=target)
+        _kill_port_holder(target if target is not None else 8052, killed_pids)
 
     # 3. Kill all spawned agents and repo-owned leftovers
     _collect_pids_from_agents_json(killed_pids)
@@ -707,7 +800,7 @@ def hard_stop() -> None:
         console.print(f"[yellow]Could not stop tunnels: {exc}[/yellow]")
 
     # 6. Clean up stale runtime artifacts
-    _cleanup_runtime_artifacts()
+    _cleanup_runtime_artifacts(targets)
 
     # 7. Return claimed tickets to open
     try:
@@ -746,7 +839,19 @@ def hard_stop() -> None:
     default=False,
     help="Hard stop: kill immediately without waiting.",
 )
-def stop(timeout: int, force: bool) -> None:
+@click.option(
+    "--port",
+    type=int,
+    default=None,
+    help=(
+        "Stop only the instance namespaced under .sdd/runtime/<port>/ (see "
+        "--auto-port on `bernstein run`). Default: hard stop sweeps every "
+        "locally running instance (legacy flat layout + all namespaced "
+        "ports found on disk); soft stop targets the default port 8052 "
+        "unless BERNSTEIN_SERVER_URL points elsewhere."
+    ),
+)
+def stop(timeout: int, force: bool, port: int | None) -> None:
     """Stop all agents and the task server.
 
     Default (soft stop): writes SHUTDOWN signal files so agents can save
@@ -757,15 +862,19 @@ def stop(timeout: int, force: bool) -> None:
     With ``--force`` / ``--hard``: skips signal files and waiting, kills
     everything immediately with SIGKILL, then does best-effort session
     save and ticket recovery.
+
+    With ``--port``: targets only the Bernstein instance running on that
+    port, leaving other concurrently running instances (started with
+    ``--auto-port`` or a different ``--port``) untouched.
     """
     print_banner()
 
     if force:
         console.print("[bold red]Hard stop - killing everything immediately...[/bold red]\n")
-        hard_stop()
+        hard_stop(port=port)
     else:
         console.print("[bold]Soft stop - giving agents time to save...[/bold]\n")
-        soft_stop(timeout)
+        soft_stop(timeout, port=port)
         _unregister_mcp_discovery(Path.cwd())
         try:
             n = stop_active_tunnels()

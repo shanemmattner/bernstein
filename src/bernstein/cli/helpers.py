@@ -35,9 +35,41 @@ SDD_DIRS = [
     ".sdd/audit/merkle",
     ".sdd/chat",
 ]
+# Legacy flat-layout constants, kept for back-compat with runs started
+# before port-namespacing shipped (and as the default single-run fallback
+# path when a namespaced dir for the resolved port doesn't exist).
 SDD_PID_SERVER = ".sdd/runtime/server.pid"
 SDD_PID_SPAWNER = ".sdd/runtime/spawner.pid"
 SDD_PID_WATCHDOG = ".sdd/runtime/watchdog.pid"
+
+
+def _server_port_from_env() -> int:
+    """Best-effort TCP port implied by ``BERNSTEIN_SERVER_URL``, default 8052."""
+    from urllib.parse import urlparse
+
+    with suppress(ValueError):
+        parsed = urlparse(SERVER_URL)
+        if parsed.port:
+            return parsed.port
+    return 8052
+
+
+def sdd_pid_server(port: int | None = None) -> str:
+    """Path to the namespaced server PID file for *port* (default: env-resolved port)."""
+    p = port if port is not None else _server_port_from_env()
+    return f".sdd/runtime/{p}/server.pid"
+
+
+def sdd_pid_spawner(port: int | None = None) -> str:
+    """Path to the namespaced spawner PID file for *port* (default: env-resolved port)."""
+    p = port if port is not None else _server_port_from_env()
+    return f".sdd/runtime/{p}/spawner.pid"
+
+
+def sdd_pid_watchdog(port: int | None = None) -> str:
+    """Path to the namespaced watchdog PID file for *port* (default: env-resolved port)."""
+    p = port if port is not None else _server_port_from_env()
+    return f".sdd/runtime/{p}/watchdog.pid"
 
 # Use ASCII-safe banner on Windows to avoid cp1252 encoding issues
 if sys.platform == "win32":

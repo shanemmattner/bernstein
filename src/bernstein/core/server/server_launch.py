@@ -19,7 +19,7 @@ import httpx
 
 from bernstein.core.process_utils import is_process_alive
 from bernstein.core.router import TierAwareRouter, load_providers_from_yaml
-from bernstein.core.runtime_state import rotate_log_file
+from bernstein.core.runtime_state import get_runtime_dir, rotate_log_file
 from bernstein.core.seed import SeedConfig, seed_to_initial_task
 
 if TYPE_CHECKING:
@@ -50,16 +50,21 @@ class BootstrapResult:
     manager_task_id: str
 
 
-def _clean_stale_runtime(workdir: Path) -> None:
-    """Remove stale PID files and old logs from .sdd/runtime/.
+def _clean_stale_runtime(workdir: Path, port: int = 8052) -> None:
+    """Remove stale PID files and old logs from .sdd/runtime/<port>/.
 
     Called before starting a new run to prevent "server already running"
-    errors from crashed previous runs.
+    errors from crashed previous runs. Only touches the namespaced runtime
+    directory for *port* -- other concurrently-running Bernstein instances
+    (different ports, same repo) are left untouched.
 
     Args:
         workdir: Project root directory.
+        port: TCP port this run is bound to. Defaults to 8052 (the
+            single-run default) so existing single-arg callers keep working
+            unchanged.
     """
-    runtime_dir = workdir / ".sdd" / "runtime"
+    runtime_dir = workdir / ".sdd" / "runtime" / str(port)
     if not runtime_dir.exists():
         return
 
@@ -292,7 +297,9 @@ def _start_server(
     preflight_multi_worker_guard()
     logger.info("Starting task server on %s:%d (single-worker mode)", bind_host, port)
 
-    pid_path = workdir / ".sdd" / "runtime" / "server.pid"
+    runtime_dir = get_runtime_dir(workdir, port)
+    pid_path = runtime_dir / "server.pid"
+    logger.debug("_start_server: namespaced pid_path=%s (port=%d)", pid_path, port)
     existing = _read_pid(pid_path)
     if existing is not None and _is_alive(existing):
         raise RuntimeError(f"Server already running (PID {existing}). Run `bernstein stop` first.")
@@ -355,7 +362,7 @@ def _start_server(
     # for back-compat but no longer toggles reload.
     _ = evolve_mode  # intentional: parameter retained for compatibility
 
-    log_path = workdir / ".sdd" / "runtime" / "server.log"
+    log_path = runtime_dir / "server.log"
     rotate_log_file(log_path)
     # Keep the log file open - child inherits the fd via fork().
     # Closing it prematurely can cause the child's stdout to break.
@@ -534,8 +541,10 @@ def _start_spawner(
     emitted by the heuristic model selector for manager-spawned child tasks
     into a model the resolved non-Claude adapter actually understands.
     """
-    pid_path = workdir / ".sdd" / "runtime" / "spawner.pid"
-    log_path = workdir / ".sdd" / "runtime" / "spawner.log"
+    runtime_dir = get_runtime_dir(workdir, port)
+    pid_path = runtime_dir / "spawner.pid"
+    log_path = runtime_dir / "spawner.log"
+    logger.debug("_start_spawner: namespaced pid_path=%s log_path=%s (port=%d)", pid_path, log_path, port)
     rotate_log_file(log_path)
 
     # Pass cluster-related env vars to the spawner subprocess so the
