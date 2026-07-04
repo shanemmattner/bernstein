@@ -62,6 +62,592 @@ from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
+# Wave 3 (per-agent instrumentation): monotonically increasing ids for
+# llm-calls.jsonl / tool-calls.jsonl records within this process. Reset per
+# ``run()`` invocation via ``_reset_instrumentation_counters`` so repeated
+# in-process invocations (e.g. tests that call ``run()`` more than once)
+# don't accumulate call ids across sessions.
+_llm_call_counter = itertools.count(1)
+_tool_call_counter = itertools.count(1)
+
+# FIFO of open tool_call starts, keyed by tool name. The SDK's event stream
+# (``tool_call`` then ``tool_result``) carries no call id to correlate the
+# two events, so this assumes same-name tool calls complete in the order
+# they started (true for the synchronous, single-threaded builtin tool
+# implementations wave 3 hooks - see openai_agents_builtins.py). A future
+# wave that makes tool execution concurrent within one turn should have the
+# event source emit an explicit id instead of relying on this ordering
+# assumption (documented as a gap in the wave-3 final report).
+_pending_tool_calls: dict[str, list[dict[str, Any]]] = {}
+
+# Conversation message index, shared across the initial system/user messages
+# logged before the SDK run and the post-hoc turns extracted from the
+# result's ``new_items`` afterwards (see gap note in
+# ``_log_result_conversation_messages``).
+_conversation_idx_counter = itertools.count(0)
+
+# Wave 4 (per-turn instrumentation, fixing the "only one aggregate llm-call
+# entry per agent" bug): count of llm-calls.jsonl entries written by the
+# SDK RunHooks-driven on_llm_end hook (see _build_instrumentation_hooks)
+# during the CURRENT run() invocation. When this is > 0 at the end of the
+# session, two pre-existing "single aggregate entry" code paths are
+# deliberately SKIPPED so a run doesn't get N precise per-turn entries PLUS
+# a duplicate aggregate/post-hoc one: (1) the "usage" branch of
+# _instrument_event no longer mirrors an llm-call entry, and (2) the
+# post-hoc _log_result_conversation_messages() call is skipped in favor of
+# the real-time per-turn conversation logging the hook already did (see
+# _log_hook_turn_conversation). Reset per run() via
+# _reset_instrumentation_counters so a fresh invocation (e.g. a test
+# calling run() twice) starts clean.
+_hook_llm_calls_logged: int = 0
+
+
+def _reset_instrumentation_counters() -> None:
+    """Reset per-process instrumentation counters/state (test/re-run hygiene)."""
+    global _llm_call_counter, _tool_call_counter, _conversation_idx_counter, _hook_llm_calls_logged
+    _llm_call_counter = itertools.count(1)
+    _tool_call_counter = itertools.count(1)
+    _conversation_idx_counter = itertools.count(0)
+    _hook_llm_calls_logged = 0
+    _pending_tool_calls.clear()
+
+
+def _mark_hook_llm_call_logged() -> None:
+    """Record that the per-turn RunHooks path wrote one llm-calls.jsonl entry.
+
+    Called exactly once per successful (or hook-detected-failed) turn from
+    inside the dynamically-built ``RunHooks`` subclass in
+    :func:`_build_instrumentation_hooks`. See :data:`_hook_llm_calls_logged`
+    docstring for why downstream aggregate-logging paths check this.
+    """
+    global _hook_llm_calls_logged
+    _hook_llm_calls_logged += 1
+
+
+def _log_initial_conversation_messages(manifest: RunnerManifest) -> None:
+    """Log the system addendum (if any) and the task prompt as messages 0/1.
+
+    This is the ONLY part of this runner's conversation instrumentation that
+    reflects true real-time message-append order: the openai-agents SDK does
+    not expose its internal, turn-by-turn growing message list to the
+    caller while ``Runner.run_sync`` is executing (it is entirely internal
+    to the SDK's run loop) - only the final accumulated result afterwards.
+    See :func:`_log_result_conversation_messages` for the post-hoc
+    best-effort coverage of what happened during the run, and the wave-3
+    final report for this documented gap.
+    """
+    instrumenter = get_instrumenter()
+    if manifest.system_addendum:
+        logger.debug(
+            "_log_initial_conversation_messages: logging system_addendum, length=%d",
+            len(manifest.system_addendum),
+        )
+        instrumenter.log_message(
+            idx=next(_conversation_idx_counter),
+            role="system",
+            content_length=len(manifest.system_addendum),
+            content=manifest.system_addendum,
+        )
+    logger.debug("_log_initial_conversation_messages: logging user prompt, length=%d", len(manifest.prompt))
+    instrumenter.log_message(
+        idx=next(_conversation_idx_counter),
+        role="user",
+        content_length=len(manifest.prompt),
+        content=manifest.prompt,
+    )
+
+
+def _log_result_conversation_messages(result: Any) -> None:
+    """Best-effort post-hoc conversation logging from the SDK's ``RunResult``.
+
+    ``Runner.run_sync`` returns ``new_items`` - the SDK's own list of every
+    item (message, tool call, tool output, ...) generated during the run.
+    Reading it AFTER completion is the only place the accumulated
+    conversation is available at all (see
+    :func:`_log_initial_conversation_messages`'s docstring) - the
+    ``ts`` recorded here is therefore "when we logged it", not "when the SDK
+    actually appended it", and the whole run's turns appear at once rather
+    than incrementally. Every attribute access is defensive (``getattr``
+    with a default) since ``new_items`` element shapes vary by SDK version
+    and item type, and a council run's ``result`` has no ``new_items`` at
+    all (each member's own sub-result is not surfaced here - out of scope
+    for this best-effort pass).
+    """
+    try:
+        new_items = getattr(result, "new_items", None) or []
+    except Exception as exc:
+        logger.warning("_log_result_conversation_messages: failed to read new_items: %s", exc)
+        return
+
+    instrumenter = get_instrumenter()
+    for item in new_items:
+        try:
+            raw_item = getattr(item, "raw_item", item)
+            item_type = type(item).__name__
+            role = str(getattr(raw_item, "role", None) or _infer_role_from_item_type(item_type))
+            content = getattr(raw_item, "content", None)
+            tool_name = getattr(raw_item, "name", None)
+            content_text = str(content) if content is not None else str(raw_item)
+            content_length = len(content_text)
+            instrumenter.log_message(
+                idx=next(_conversation_idx_counter),
+                role=role,
+                content_length=content_length,
+                content=content_text,
+                tool_calls=[str(tool_name)] if tool_name else None,
+            )
+        except Exception as exc:
+            logger.warning("_log_result_conversation_messages: skipped one item (%s): %s", type(item).__name__, exc)
+
+    try:
+        final_output = getattr(result, "final_output", None)
+        if final_output is not None:
+            final_output_text = str(final_output)
+            instrumenter.log_message(
+                idx=next(_conversation_idx_counter),
+                role="assistant",
+                content_length=len(final_output_text),
+                content=final_output_text,
+            )
+    except Exception as exc:
+        logger.warning("_log_result_conversation_messages: failed to log final_output: %s", exc)
+
+
+def _infer_role_from_item_type(item_type: str) -> str:
+    """Map an SDK ``RunItem`` subclass name onto a role label for logging."""
+    lowered = item_type.lower()
+    if "tool" in lowered:
+        return "tool"
+    if "message" in lowered or "output" in lowered:
+        return "assistant"
+    return "unknown"
+
+
+def _log_hook_turn_conversation(response: Any) -> None:
+    """Log one conversation.jsonl entry per output item generated THIS turn.
+
+    Called from the per-turn ``on_llm_end`` hook (see
+    :func:`_build_instrumentation_hooks`) with the SDK's ``ModelResponse``
+    for that single LLM call. Unlike :func:`_log_result_conversation_messages`
+    (the old best-effort path - still used as a fallback for runs where the
+    hooks path never engaged, e.g. a task-level council run, see the
+    ``_hook_llm_calls_logged`` guards in :func:`_run_session`), this fires
+    in REAL TIME as each turn completes rather than once, after-the-fact,
+    for the whole session - fixing the "conversation.jsonl only shows a
+    final summary" half of this wave's bug report.
+
+    Wrapped defensively exactly like its post-hoc sibling: a malformed or
+    unexpected ``response.output`` item shape must never crash the agent
+    run being observed.
+    """
+    instrumenter = get_instrumenter()
+    try:
+        output_items = getattr(response, "output", None) or []
+    except Exception as exc:
+        logger.warning("_log_hook_turn_conversation: failed to read response.output: %s", exc)
+        return
+
+    for item in output_items:
+        try:
+            item_type = type(item).__name__
+            role = str(getattr(item, "role", None) or _infer_role_from_item_type(item_type))
+            content = getattr(item, "content", None)
+            tool_name = getattr(item, "name", None)
+            content_text = str(content) if content is not None else str(item)
+            content_length = len(content_text)
+            instrumenter.log_message(
+                idx=next(_conversation_idx_counter),
+                role=role,
+                content_length=content_length,
+                content=content_text,
+                tool_calls=[str(tool_name)] if tool_name else None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "_log_hook_turn_conversation: skipped one item (%s): %s",
+                type(item).__name__,
+                exc,
+            )
+
+
+def _model_name_for_hooks(agent: Any, manifest: RunnerManifest) -> str:
+    """Best-effort real model id for a per-turn hook's llm-calls.jsonl entry.
+
+    ``agent.model`` is either a plain string (the common case) or an SDK
+    ``Model`` instance - e.g. ``OpenAIChatCompletionsModel``, built by the
+    ``explicit_model_client`` branch in :func:`_run_session` for
+    ``base_url``-overridden endpoints - which itself exposes the underlying
+    model id as its OWN ``.model`` attribute (confirmed via on-disk
+    inspection of ``agents/models/openai_chatcompletions.py``:
+    ``self.model = model`` in ``__init__``). Falls back to
+    ``manifest.model`` and never raises, so a model-name lookup can never
+    crash the run a hook is observing.
+    """
+    try:
+        model_attr = getattr(agent, "model", None)
+        if isinstance(model_attr, str) and model_attr:
+            return model_attr
+        if model_attr is not None:
+            inner = getattr(model_attr, "model", None)
+            if isinstance(inner, str) and inner:
+                return inner
+    except Exception as exc:
+        logger.warning(
+            "_model_name_for_hooks: failed to resolve model name for session=%s, falling back to manifest.model=%r: %s",
+            manifest.session_id,
+            manifest.model,
+            exc,
+        )
+    return manifest.model
+
+
+def _build_instrumentation_hooks(sdk: Any, manifest: RunnerManifest) -> Any:
+    """Build a per-run ``RunHooks`` instance wired to the ``RunInstrumenter``.
+
+    This is the wave-4 fix for "only one aggregate llm-call entry gets
+    logged per agent instead of one entry per actual per-turn LLM call".
+    On-disk inspection of the installed SDK (openai-agents 0.17.7,
+    ``agents/lifecycle.py``) shows ``RunHooksBase`` exposes
+    ``on_llm_start``/``on_llm_end`` firing once PER MODEL CALL (turn) with
+    that turn's ``ModelResponse`` (usage, output items), and
+    ``on_tool_start``/``on_tool_end`` firing once PER TOOL CALL with a
+    ``ToolContext`` carrying ``tool_call_id``/``tool_name``/
+    ``tool_arguments`` - exactly the granularity llm-calls.jsonl and
+    tool-calls.jsonl are supposed to have. ``Runner.run_sync`` already
+    accepts a ``hooks: RunHooks[TContext] | None`` kwarg (see its signature
+    in ``agents/run.py``) that the SDK threads straight through its
+    internal turn loop, so no switch to ``Runner.run_streamed()`` is
+    needed - wiring ``hooks=`` into the existing ``run_sync_kwargs`` in
+    :func:`_run_session` is sufficient.
+
+    Tool-call hook logging is deliberately SKIPPED when
+    ``manifest.tool_source == "builtin"``:
+    :mod:`bernstein.adapters.openai_agents_builtins` already emits its own
+    ``tool_call``/``tool_result`` stdout events for the four
+    workdir-sandboxed builtins, which :func:`_instrument_event` already
+    mirrors into tool-calls.jsonl via the ``_pending_tool_calls`` FIFO.
+    Wiring the hook unconditionally would double-log every builtin tool
+    call (once from the builtin's own emit_event, once from the hook).
+    Gateway-sourced tools (``tool_source == "gateway"``, the default) have
+    NO other tool-call logging path today, so the hook is the ONLY source
+    of tool-calls.jsonl coverage for them.
+
+    Args:
+        sdk: The imported ``agents`` module (already cast to ``Any`` by the
+            caller in :func:`_run_session`).
+        manifest: The parsed runner manifest for this session.
+
+    Returns:
+        An instance of a dynamically-created ``sdk.RunHooks`` subclass.
+        Built dynamically (not a module-level class) because ``sdk.RunHooks``
+        - a generic alias over the lazily-imported SDK's own base class -
+        only exists once the optional SDK has actually been imported.
+    """
+    instrumenter = get_instrumenter()
+    log_tool_hooks = manifest.tool_source != "builtin"
+    logger.debug(
+        "hook registration: building instrumentation RunHooks for session=%s "
+        "tool_source=%r (tool-call hook logging %s)",
+        manifest.session_id,
+        manifest.tool_source,
+        "enabled" if log_tool_hooks else "disabled - builtin tools log via their own emit_event path",
+    )
+
+    class _InstrumentationHooks(sdk.RunHooks):  # type: ignore[misc,valid-type]
+        """Dynamically-built RunHooks subclass - see enclosing factory docstring."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._llm_call_id: str | None = None
+            self._llm_ts_start: str | None = None
+            self._pending_tools: dict[str, dict[str, Any]] = {}
+
+        async def on_llm_start(
+            self,
+            context: Any,
+            agent: Any,
+            system_prompt: Any,
+            input_items: Any,
+        ) -> None:
+            try:
+                call_id = f"c-{next(_llm_call_counter)}"
+                self._llm_call_id = call_id
+                self._llm_ts_start = _now_iso_for_instrumentation()
+                logger.debug(
+                    "hook fired: on_llm_start call_id=%s session=%s model=%s input_items=%d",
+                    call_id,
+                    manifest.session_id,
+                    _model_name_for_hooks(agent, manifest),
+                    len(input_items) if input_items is not None else 0,
+                )
+            except Exception as exc:
+                logger.warning("on_llm_start hook failed for session=%s: %s", manifest.session_id, exc)
+
+        async def on_llm_end(self, context: Any, agent: Any, response: Any) -> None:
+            ts_end = _now_iso_for_instrumentation()
+            call_id = self._llm_call_id or f"c-{next(_llm_call_counter)}"
+            ts_start = self._llm_ts_start or ts_end
+            self._llm_call_id = None
+            self._llm_ts_start = None
+            try:
+                model_name = _model_name_for_hooks(agent, manifest)
+                usage = getattr(response, "usage", None)
+                prompt_tokens = int(getattr(usage, "input_tokens", 0) or 0) if usage is not None else None
+                completion_tokens = int(getattr(usage, "output_tokens", 0) or 0) if usage is not None else None
+                total_tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else None
+                instrumenter.log_llm_call(
+                    call_id=call_id,
+                    ts_start=ts_start,
+                    ts_end=ts_end,
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    status="ok",
+                )
+                _mark_hook_llm_call_logged()
+                logger.debug(
+                    "wrote llm_call entry call_id=%s session=%s model=%s usage_prompt=%s "
+                    "usage_completion=%s usage_total=%s",
+                    call_id,
+                    manifest.session_id,
+                    model_name,
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                )
+                _log_hook_turn_conversation(response)
+            except Exception as exc:
+                logger.warning(
+                    "on_llm_end hook failed for session=%s call_id=%s: %s - logging a "
+                    "status=error placeholder entry so this turn is not silently missing "
+                    "from llm-calls.jsonl",
+                    manifest.session_id,
+                    call_id,
+                    exc,
+                )
+                try:
+                    instrumenter.log_llm_call(
+                        call_id=call_id,
+                        ts_start=ts_start,
+                        ts_end=ts_end,
+                        model=manifest.model,
+                        status="error",
+                        error=f"on_llm_end hook failed: {type(exc).__name__}: {exc}",
+                    )
+                    _mark_hook_llm_call_logged()
+                except Exception as inner_exc:
+                    logger.warning(
+                        "on_llm_end hook: even the status=error fallback log_llm_call "
+                        "failed for session=%s call_id=%s: %s",
+                        manifest.session_id,
+                        call_id,
+                        inner_exc,
+                    )
+
+        async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+            if not log_tool_hooks:
+                return
+            try:
+                tool_name = str(getattr(tool, "name", "unknown"))
+                tool_call_id = str(getattr(context, "tool_call_id", None) or f"unkeyed-{next(_tool_call_counter)}")
+                call_id = f"tc-{next(_tool_call_counter)}"
+                raw_args = getattr(context, "tool_arguments", None)
+                args_dict: dict[str, Any]
+                if isinstance(raw_args, str):
+                    try:
+                        parsed_args = json.loads(raw_args)
+                        args_dict = parsed_args if isinstance(parsed_args, dict) else {"args": parsed_args}
+                    except (json.JSONDecodeError, TypeError):
+                        args_dict = {"raw_args": raw_args}
+                elif isinstance(raw_args, dict):
+                    args_dict = raw_args
+                else:
+                    args_dict = {}
+                self._pending_tools[tool_call_id] = {
+                    "call_id": call_id,
+                    "ts_start": _now_iso_for_instrumentation(),
+                    "tool": tool_name,
+                    "args": args_dict,
+                }
+                # tool_name/tool_call_id originate in the model's response
+                # stream - sanitize before logging (established repo pattern
+                # for externally-derived values).
+                logger.debug(
+                    "hook fired: on_tool_start call_id=%s tool=%s tool_call_id=%s session=%s",
+                    call_id,
+                    sanitize_log(tool_name),
+                    sanitize_log(tool_call_id),
+                    manifest.session_id,
+                )
+            except Exception as exc:
+                logger.warning("on_tool_start hook failed for session=%s: %s", manifest.session_id, exc)
+
+        async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
+            if not log_tool_hooks:
+                return
+            ts_end = _now_iso_for_instrumentation()
+            try:
+                tool_name = str(getattr(tool, "name", "unknown"))
+                tool_call_id = str(getattr(context, "tool_call_id", None) or "")
+                pending = self._pending_tools.pop(tool_call_id, None)
+                call_id = pending["call_id"] if pending else f"tc-{next(_tool_call_counter)}"
+                ts_start = pending["ts_start"] if pending else ts_end
+                args = pending["args"] if pending else None
+                is_error = isinstance(result, BaseException)
+                # Bug fix (instrumentation audit, bug 2): tool-calls.jsonl
+                # previously never recorded what a tool actually returned -
+                # only its name/args/success flag - making it impossible to
+                # see tool output without re-running the agent. The SDK's
+                # on_tool_end hook receives the tool's return value directly
+                # as `result` (a BaseException on failure per the is_error
+                # check above, otherwise whatever the tool function
+                # returned - str, dict, etc.); RunInstrumenter.log_tool_call
+                # stringifies + truncates it. On the error path pass None
+                # (the error string itself is already captured in the
+                # `error` field) rather than duplicating the exception text.
+                result_for_log = None if is_error else result
+                logger.debug(
+                    "on_tool_end: tool=%s call_id=%s is_error=%s result_type=%s",
+                    tool_name,
+                    call_id,
+                    is_error,
+                    type(result).__name__,
+                )
+                instrumenter.log_tool_call(
+                    call_id=call_id,
+                    ts_start=ts_start,
+                    ts_end=ts_end,
+                    tool=tool_name,
+                    args=args,
+                    success=not is_error,
+                    error=f"{type(result).__name__}: {result}" if is_error else None,
+                    result=result_for_log,
+                )
+                logger.debug(
+                    "wrote tool_call entry call_id=%s tool=%s session=%s success=%s",
+                    call_id,
+                    sanitize_log(tool_name),
+                    manifest.session_id,
+                    not is_error,
+                )
+            except Exception as exc:
+                logger.warning("on_tool_end hook failed for session=%s: %s", manifest.session_id, exc)
+
+    return _InstrumentationHooks()
+
+
+def _instrument_event(event: Mapping[str, Any]) -> None:
+    """Best-effort translation of a runner stdout event into instrumentation records.
+
+    Called from :func:`emit_event` for every event this runner already emits
+    - it never changes what gets written to stdout, only additionally mirrors
+    a subset of events into the active :class:`RunInstrumenter` (a no-op
+    singleton until :func:`bernstein.core.instrumentation.init_instrumenter`
+    has been called, e.g. before any SDK work starts in :func:`run`).
+
+    Wrapped in a broad ``try/except`` so a malformed/unexpected event shape
+    can never break the actual event stream this function is piggybacking
+    on - see module docstring on :mod:`bernstein.core.instrumentation`.
+    """
+    try:
+        event_type = event.get("type")
+        instrumenter = get_instrumenter()
+        now = _now_iso_for_instrumentation()
+
+        if event_type == "usage":
+            if _hook_llm_calls_logged > 0:
+                # Wave 4: the per-turn RunHooks path (_build_instrumentation_hooks)
+                # already wrote one llm-calls.jsonl entry per real LLM call this
+                # session. This aggregate "usage" event is still needed for
+                # stdout/cost-metering (_emit_session_usage), but mirroring it
+                # into llm-calls.jsonl too would append a stale duplicate
+                # aggregate entry on top of the N precise per-turn ones.
+                logger.debug(
+                    "_instrument_event: skipping aggregate llm-call mirror for usage "
+                    "event - %d precise per-turn entries already logged via RunHooks "
+                    "this session",
+                    _hook_llm_calls_logged,
+                )
+                return
+            call_id = f"c-{next(_llm_call_counter)}"
+            usage_missing = bool(event.get("usage_missing"))
+            instrumenter.log_llm_call(
+                call_id=call_id,
+                ts_start=now,
+                ts_end=now,
+                model=str(event.get("model", "")),
+                prompt_tokens=cast("int | None", event.get("input_tokens")),
+                completion_tokens=cast("int | None", event.get("output_tokens")),
+                status="error" if usage_missing else "ok",
+                error="usage_missing: SDK returned no usable token counts" if usage_missing else None,
+            )
+            # ts_start == ts_end here because the SDK only exposes an
+            # AGGREGATE usage total for the whole session/council-member
+            # (see ``_emit_session_usage``'s docstring), not per-call
+            # wall-clock timing - wall_ms would be fabricated if computed
+            # from these two identical timestamps, so callers reading
+            # llm-calls.jsonl for this adapter should treat wall_ms==0 as
+            # "unknown", not "instant". This is a documented gap - see the
+            # wave-3 final report.
+            return
+
+        if event_type == "tool_call":
+            name = str(event.get("name", "unknown"))
+            call_id = f"tc-{next(_tool_call_counter)}"
+            _pending_tool_calls.setdefault(name, []).append(
+                {"call_id": call_id, "ts_start": now, "args": event.get("args")}
+            )
+            return
+
+        if event_type == "tool_result":
+            name = str(event.get("name", "unknown"))
+            pending_list = _pending_tool_calls.get(name)
+            pending = pending_list.pop(0) if pending_list else None
+            call_id = pending["call_id"] if pending else f"tc-{next(_tool_call_counter)}"
+            ts_start = pending["ts_start"] if pending else now
+            args = pending["args"] if pending else None
+            is_error = bool(event.get("is_error")) or bool(event.get("error"))
+            # Bug fix (instrumentation audit, bug 2): mirror whatever
+            # result-shaped data the emitting event carries. Today's builtin
+            # tool emitters (openai_agents_builtins.py) only send metadata
+            # (bytes/count), never the actual content, so this is best-effort
+            # and frequently None for builtin-sourced events - the primary
+            # fix for gateway-sourced tools is the on_tool_end hook path
+            # above, which DOES see the tool's real return value.
+            result_value = event.get("result") if "result" in event else event.get("output")
+            if result_value is None and not is_error:
+                # Fall back to whatever non-standard metadata keys this event
+                # carries (e.g. bytes/count) so SOMETHING beyond
+                # success/failure survives to tool-calls.jsonl even without
+                # a first-class result payload.
+                metadata_preview = {
+                    k: v for k, v in event.items() if k not in {"type", "name", "tool_source", "status", "error"}
+                }
+                if metadata_preview:
+                    result_value = metadata_preview
+            instrumenter.log_tool_call(
+                call_id=call_id,
+                ts_start=ts_start,
+                ts_end=now,
+                tool=name,
+                args=args if isinstance(args, dict) else {"args": args},
+                success=not is_error,
+                error=str(event.get("error")) if event.get("error") else None,
+                result=result_value,
+            )
+            return
+    except Exception as exc:
+        logger.warning("_instrument_event failed for event type=%r: %s", event.get("type"), exc)
+
+
+def _now_iso_for_instrumentation() -> str:
+    """Local import-free ISO timestamp helper (mirrors instrumentation._now_iso)."""
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.UTC).isoformat(timespec="milliseconds")
+
+
 # Exit codes are part of the public contract with the adapter - keep in sync
 # with the module docstring above.
 EXIT_OK: int = 0
@@ -286,6 +872,38 @@ class RunnerManifest:
     base_url: str | None = None
     api_key_env: str | None = None
     heartbeat_dir: str | None = None
+    # Wave 3 (per-agent instrumentation): Bernstein task id this session is
+    # working, injected by ``spawner_core`` (mirrors ``heartbeat_dir`` -
+    # resolved on the SPAWN side, since the runner has no other way to know
+    # which orchestrator task it belongs to). ``None`` when absent (e.g. a
+    # hand-written manifest for a direct invocation/test) - the runner then
+    # instruments under a literal "unknown" task bucket rather than failing.
+    task_id: str | None = None
+    # Bug fix (instrumentation audit, bug 3 - "4 of 9 implement tasks have
+    # zero instrumentation"): when spawner_core batches multiple Bernstein
+    # tasks onto ONE agent process (``_spawn_for_tasks_internal``'s
+    # ``tasks: list[Task]``), only ``tasks[0].id`` was ever threaded through
+    # as ``task_id`` above - every OTHER task in the batch got no
+    # instrumentation directory at all, since a single RunInstrumenter only
+    # ever knew about one task_id. ``task_ids`` carries the FULL batch (all
+    # task ids this agent process is working, ``task_id`` included) so
+    # :func:`run` can fan the same instrumentation out to every task's
+    # ``.sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/`` directory,
+    # not just the first. ``None``/empty on hand-written manifests and on
+    # single-task spawns (the common case) - the runner then falls back to
+    # the single ``task_id`` dir exactly as before.
+    task_ids: list[str] | None = None
+    # Wave 3 (per-agent instrumentation): orchestrator-root directory,
+    # injected by ``spawner_core`` (mirrors ``heartbeat_dir`` above - same
+    # reasoning: ``workdir`` is a per-session worktree under default
+    # isolation, deleted on cleanup/merge, so instrumentation JSONL must be
+    # anchored to the project root the orchestrator itself uses for
+    # ``.sdd/runs/<run_id>/summary.json`` - see
+    # :func:`bernstein.core.orchestration.run_report.write_summary_json`).
+    # ``None`` when absent (e.g. a hand-written manifest for a direct
+    # invocation/test) - the runner then falls back to ``workdir``, which is
+    # also correct for those callers since there is no separate worktree.
+    instrumentation_root: str | None = None
     # Control knobs resolved by the SPAWN side. They must travel in the
     # manifest because the spawner hands the runner a filtered environment
     # (env_isolation) that strips BERNSTEIN_* control vars - parent-env
@@ -877,6 +1495,69 @@ def run(manifest: RunnerManifest) -> int:
     Returns:
         Process exit code.  See module docstring for the contract.
     """
+    # Wave 3 (per-agent instrumentation): stand up this process's
+    # RunInstrumenter before any SDK/event work so every subsequent
+    # emit_event() call (including the "start" event right below) is
+    # eligible for mirroring. run_id comes from the orchestrator via the
+    # BERNSTEIN_RUN_ID env var (threaded through env_isolation's
+    # allowlist); task_id from the manifest (spawner_core-injected, see
+    # spawner_core.py's openai_agents-scoped mcp_config injection);
+    # agent_id is this session's own id. Falls back to literal "unknown"
+    # values rather than failing the run when either is absent (e.g. a
+    # hand-written manifest for a direct-invocation test).
+    _reset_instrumentation_counters()
+    run_id = os.environ.get("BERNSTEIN_RUN_ID", "unknown")
+    task_id = manifest.task_id or "unknown"
+    # Prefer ``instrumentation_root`` (the orchestrator's project root,
+    # injected by spawner_core) over ``manifest.workdir``. Under default
+    # worktree isolation ``workdir`` is a per-session worktree that gets
+    # deleted on cleanup/merge - instrumentation written there would either
+    # never be found (wave-2's summary.json lives at the project root) or
+    # vanish entirely once the worktree is torn down. Hand-written
+    # manifests (tests, direct invocation) have no worktree at all, so
+    # falling back to ``workdir`` there is correct.
+    instrumentation_base = manifest.instrumentation_root or manifest.workdir
+    agent_dir = resolve_agent_dir(Path(instrumentation_base), run_id, task_id, manifest.session_id)
+
+    # Bug fix (instrumentation audit, bug 3): if this agent process is
+    # working a BATCH of tasks (manifest.task_ids has more than one entry),
+    # resolve an agent dir for every OTHER task in the batch too and pass
+    # them as extra_dirs so init_instrumenter fans every JSONL write out to
+    # all of them - see RunnerManifest.task_ids and RunInstrumenter.extra_dirs
+    # docstrings for the full root-cause writeup.
+    batch_task_ids = list(manifest.task_ids or [])
+    extra_dirs = [
+        resolve_agent_dir(Path(instrumentation_base), run_id, other_task_id, manifest.session_id)
+        for other_task_id in batch_task_ids
+        if other_task_id and other_task_id != task_id
+    ]
+    if batch_task_ids:
+        logger.info(
+            "Batched-task instrumentation check: manifest.task_ids=%s primary task_id=%s -> "
+            "%d extra instrumentation dir(s) will receive a full copy of this agent's records",
+            batch_task_ids,
+            task_id,
+            len(extra_dirs),
+        )
+    if not manifest.task_id:
+        logger.debug(
+            "run(): manifest.task_id is unset - this session's instrumentation will be bucketed "
+            "under the literal 'unknown' task_id; run_id from env BERNSTEIN_RUN_ID=%s",
+            os.environ.get("BERNSTEIN_RUN_ID"),
+        )
+    init_instrumenter(
+        run_id=run_id, task_id=task_id, agent_id=manifest.session_id, base_dir=agent_dir, extra_dirs=extra_dirs
+    )
+    logger.info(
+        "Instrumentation base dir resolved: instrumentation_root=%r workdir=%r -> using %r -> agent_dir=%s "
+        "extra_dirs=%s",
+        manifest.instrumentation_root,
+        manifest.workdir,
+        instrumentation_base,
+        agent_dir,
+        extra_dirs,
+    )
+
     # Every effective sampling/endpoint param is logged here.  The key
     # itself is never logged - only the NAME of the env var that holds it.
     emit_event(

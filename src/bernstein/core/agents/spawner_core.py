@@ -2946,6 +2946,66 @@ class AgentSpawner:
                     # adapter never inherits another adapter's extras.
                     attempt_mcp = self._mcp_config_for_adapter(target_adapter, effective_mcp)
 
+                    # Wave 3 (per-agent instrumentation): tell the
+                    # openai_agents runner subprocess which task it is
+                    # working so its RunInstrumenter writes to
+                    # .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/
+                    # instead of an "unknown" task bucket. Scoped to the
+                    # openai_agents adapter only: other adapters pass
+                    # mcp_config through to their own CLI flags verbatim,
+                    # and a stray top-level "task_id" key there is an
+                    # unnecessary risk for no benefit (those adapters are
+                    # not instrumented in this wave).
+                    if "openai_agents" in adapter_name and tasks:
+                        attempt_mcp = dict(attempt_mcp or {})
+                        attempt_mcp.setdefault("task_id", tasks[0].id)
+                        # Bug fix (instrumentation audit, bug 3 - "4 of 9
+                        # implement tasks have zero instrumentation"): this
+                        # spawn can carry MULTIPLE tasks in one agent
+                        # process (role-batched spawns / spawn_for_resume
+                        # with a multi-task batch). Only tagging tasks[0].id
+                        # meant every OTHER task in the batch got no
+                        # instrumentation directory at all - the runner's
+                        # singleton RunInstrumenter only ever knew about the
+                        # first task. Pass the FULL id list so the runner
+                        # can fan its JSONL writes out to every task's own
+                        # agents/<agent_id>/ directory, not just the first.
+                        all_task_ids = [t.id for t in tasks if getattr(t, "id", None)]
+                        if len(all_task_ids) > 1:
+                            attempt_mcp.setdefault("task_ids", all_task_ids)
+                        logger.info(
+                            "instrumentation task-id injection: adapter=%s primary_task_id=%s "
+                            "batch_size=%d all_task_ids=%s",
+                            adapter_name,
+                            tasks[0].id,
+                            len(tasks),
+                            all_task_ids,
+                        )
+
+                    # Inline per-role council block
+                    # (``role_model_policy.<role>.council``, parsed and
+                    # validated by ``seed_parser._parse_council``): forward
+                    # it so the runner manifest gets the same ``council``
+                    # payload the ``model: councils/<name>.yaml`` file
+                    # convention produces via ``_load_council_config``.
+                    # Scoped to the openai_agents adapter only - its runner
+                    # is the sole consumer of ``manifest.council``, and
+                    # other adapters treat unknown top-level mcp_config
+                    # keys as MCP server entries (see claude.py's
+                    # bare-servers fallback). An operator-set
+                    # ``mcp_config["council"]`` always wins (setdefault).
+                    if "openai_agents" in adapter_name:
+                        role_council = role_policy.get("council")
+                        if isinstance(role_council, dict) and role_council:
+                            attempt_mcp = dict(attempt_mcp or {})
+                            attempt_mcp.setdefault("council", role_council)
+                            logger.info(
+                                "spawn_for_tasks: role=%r inline role_model_policy council block "
+                                "forwarded into the runner manifest (candidates=%d)",
+                                tasks[0].role if tasks else None,
+                                len(role_council.get("candidates") or ()),
+                            )
+
                     try:
                         # Apply OS-level resource limits to non-sandboxed spawns.
                         target_adapter.set_resource_limits(self._resource_limits)

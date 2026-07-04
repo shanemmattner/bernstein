@@ -284,6 +284,50 @@ class OpenAIAgentsAdapter(PluginAdapter):
             heartbeat_dir = mcp_config.get("heartbeat_dir")
             if isinstance(heartbeat_dir, str) and heartbeat_dir:
                 overrides["heartbeat_dir"] = heartbeat_dir
+            # Wave 3 (per-agent instrumentation): task id injected by
+            # spawner_core so the runner's RunInstrumenter can write under
+            # .sdd/runs/<run_id>/tasks/<task_id>/agents/<session_id>/.
+            # Absent on hand-written manifests (e.g. direct-invocation
+            # tests) - the runner falls back to "unknown" in that case.
+            task_id = mcp_config.get("task_id")
+            if isinstance(task_id, str) and task_id:
+                overrides["task_id"] = task_id
+            # Bug fix (instrumentation audit, bug 3 - "4 of 9 implement
+            # tasks have zero instrumentation"): spawner_core batches
+            # multiple tasks onto a single agent process for role-batched
+            # spawns, but only ever injected ``task_id`` (tasks[0].id) here
+            # - every other task in the batch got zero instrumentation
+            # coverage since the runner only knew about one task_id. When
+            # present, ``task_ids`` carries the full batch so the runner can
+            # fan instrumentation out to every task involved (see
+            # RunnerManifest.task_ids / RunInstrumenter.extra_dirs).
+            task_ids = mcp_config.get("task_ids")
+            if isinstance(task_ids, list) and task_ids:
+                cleaned_task_ids = [t for t in task_ids if isinstance(t, str) and t]
+                if cleaned_task_ids:
+                    overrides["task_ids"] = cleaned_task_ids
+            # Wave 3 (per-agent instrumentation): orchestrator-root
+            # directory injected by spawner_core (mirrors heartbeat_dir
+            # above). ``workdir`` is a per-session worktree under default
+            # isolation and gets deleted on cleanup/merge - instrumentation
+            # JSONL must be anchored to the project root, not the worktree,
+            # or the files land somewhere nobody looks and are then
+            # deleted with the worktree. Absent on hand-written manifests
+            # (e.g. direct-invocation tests) - the runner falls back to
+            # ``workdir`` in that case.
+            instrumentation_root = mcp_config.get("instrumentation_root")
+            if isinstance(instrumentation_root, str) and instrumentation_root:
+                overrides["instrumentation_root"] = instrumentation_root
+            # Task-level council override injected by spawner_core from an
+            # inline ``role_model_policy.<role>.council`` block (already
+            # parsed/validated by the seed parser). Forwarded verbatim so
+            # ``RunnerManifest.council`` is populated exactly the way the
+            # ``model: councils/<name>.yaml`` file convention populates it
+            # via ``_load_council_config`` - both paths drive the same
+            # ``manifest.council`` branch in the runner.
+            council = mcp_config.get("council")
+            if isinstance(council, dict) and council:
+                overrides["council"] = council
 
         # ``max_tokens`` from ``mcp_config`` (mode-profile override) wins; the
         # model_config value is only the fallback when the override is absent.
