@@ -13,9 +13,9 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from bernstein.core.orchestration.holds import acquire_hold, list_active_holds, release_hold
+from bernstein.core.orchestration.holds import acquire_hold, get_hold, list_active_holds, release_hold, renew_hold
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +30,14 @@ router = APIRouter(prefix="/orchestrator/holds", tags=["orchestrator-holds"])
 class HoldCreateRequest(BaseModel):
     """Body for POST /orchestrator/holds."""
 
+    # extra="forbid": reject unknown fields (e.g. a caller sending "ttl_s"
+    # instead of "ttl_seconds") with a 422 instead of silently dropping them
+    # and falling back to the default TTL. Silent field-name drift here is
+    # exactly the bug that killed a prior test run - fail loud instead.
+    model_config = ConfigDict(extra="forbid")
+
     reason: str = Field(..., description="Why the caller wants the orchestrator to stay up")
-    ttl_seconds: float | None = Field(default=None, description="Auto-expiry window; server default if omitted")
+    ttl_seconds: float | None = Field(default=None, description="Grace-window auto-expiry; server default if omitted")
 
 
 class HoldResponse(BaseModel):
@@ -42,6 +48,7 @@ class HoldResponse(BaseModel):
     created_at: float
     ttl_seconds: float
     expires_at: float
+    last_renewed_at: float | None = None
 
 
 class HoldListResponse(BaseModel):
@@ -78,6 +85,31 @@ def delete_hold(hold_id: str) -> dict[str, bool]:
     if not released:
         raise HTTPException(status_code=404, detail=f"Hold {hold_id} not found")
     return {"released": True}
+
+
+@router.post(
+    "/{hold_id}/renew",
+    response_model=HoldResponse,
+    responses={404: {"description": "Hold not found (never existed, released, or already expired)"}},
+)
+def renew_hold_endpoint(hold_id: str) -> HoldResponse:
+    """Heartbeat-renew a hold, extending its expiry by another grace window."""
+    logger.info("POST /orchestrator/holds/%s/renew", hold_id)
+    renewed = renew_hold(hold_id)
+    if not renewed:
+        logger.warning("POST /orchestrator/holds/%s/renew: not found or already expired", hold_id)
+        raise HTTPException(status_code=404, detail=f"Hold {hold_id} not found")
+    hold = get_hold(hold_id)
+    if hold is None:
+        # Should not happen (renew() just succeeded), but guard defensively.
+        logger.error("POST /orchestrator/holds/%s/renew: renew succeeded but get_hold returned None", hold_id)
+        raise HTTPException(status_code=404, detail=f"Hold {hold_id} not found")
+    logger.info(
+        "POST /orchestrator/holds/%s/renew: success, new expires_at=%.1f",
+        hold_id,
+        hold.expires_at,
+    )
+    return HoldResponse(**hold.to_dict())  # type: ignore[arg-type]
 
 
 @router.get("", response_model=HoldListResponse)

@@ -7,10 +7,13 @@ external schedulers) can prevent the orchestrator from self-stopping even
 when it looks idle.
 
 A caller acquires a :class:`Hold` via ``acquire_hold(reason, ttl_seconds)``,
-does whatever work needs the orchestrator to stay up, then calls
-``release_hold(hold_id)`` when done. Holds also expire automatically after
-their TTL so a caller that crashes or forgets to release doesn't wedge the
-orchestrator open forever.
+then periodically calls ``renew_hold(hold_id)`` (a heartbeat) for as long as
+it needs the orchestrator to stay up, then calls ``release_hold(hold_id)``
+when done. ``ttl_seconds`` is a grace window, not a run-duration estimate:
+each renewal pushes ``expires_at`` out by another ``ttl_seconds`` from "now".
+A caller that crashes or stops heartbeating has its hold auto-expire once the
+grace window elapses since the last renewal (or since acquisition, if never
+renewed) - so it doesn't wedge the orchestrator open forever.
 
 Thread-safe: backed by a single ``threading.Lock`` since this registry is
 read/written from both the FastAPI request-handling threads (via
@@ -25,11 +28,19 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TTL_SECONDS: float = 300.0
+# Grace-window semantics: as of the heartbeat-renewal model, holds are no
+# longer sized to a caller's estimated run duration. A driver acquires a hold
+# once, then calls HoldRegistry.renew(hold_id) periodically (heartbeat) to
+# keep it alive. DEFAULT_TTL_SECONDS is now the GRACE WINDOW: how long the
+# hold survives after the *last* renewal (or after acquire, if never renewed)
+# before it is considered abandoned and expires. A short grace window means a
+# crashed/hung driver stops blocking orchestrator self-stop quickly, while a
+# live driver just needs to heartbeat more often than this window.
+DEFAULT_TTL_SECONDS: float = 45.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,8 +52,13 @@ class Hold:
         reason: Human-readable reason the hold was acquired (surfaced in logs
             and in the "skipping self-stop" orchestrator message).
         created_at: Epoch seconds when the hold was acquired.
-        ttl_seconds: How long the hold stays active before auto-expiring.
-        expires_at: Epoch seconds when the hold expires (created_at + ttl_seconds).
+        ttl_seconds: Grace window - how long the hold survives after the last
+            heartbeat renewal (or since creation, if never renewed) before
+            auto-expiring.
+        expires_at: Epoch seconds when the hold expires (created_at + ttl_seconds,
+            or last_renewed_at + ttl_seconds after a renewal).
+        last_renewed_at: Epoch seconds of the most recent heartbeat renewal, or
+            None if the hold has never been renewed since acquisition.
     """
 
     id: str
@@ -50,6 +66,7 @@ class Hold:
     created_at: float
     ttl_seconds: float = DEFAULT_TTL_SECONDS
     expires_at: float = field(default=0.0)
+    last_renewed_at: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize to a JSON-safe dict for API responses."""
@@ -59,6 +76,7 @@ class Hold:
             "created_at": self.created_at,
             "ttl_seconds": self.ttl_seconds,
             "expires_at": self.expires_at,
+            "last_renewed_at": self.last_renewed_at,
         }
 
 
@@ -86,9 +104,10 @@ class HoldRegistry:
 
         Args:
             reason: Why the caller wants the orchestrator to stay up.
-            ttl_seconds: Auto-expiry window; defaults to 5 minutes so a caller
-                that crashes without releasing doesn't wedge the orchestrator
-                open indefinitely.
+            ttl_seconds: Grace-window auto-expiry; defaults to
+                DEFAULT_TTL_SECONDS (45s) so a caller that crashes without
+                releasing (and without heartbeating via renew()) doesn't wedge
+                the orchestrator open indefinitely.
 
         Returns:
             The newly created Hold.
@@ -127,6 +146,59 @@ class HoldRegistry:
             time.time() - hold.created_at,
         )
         return True
+
+    def renew(self, hold_id: str) -> bool:
+        """Heartbeat-renew a hold, pushing its expiry out by another grace window.
+
+        Args:
+            hold_id: The id of the hold to renew.
+
+        Returns:
+            True if the hold was found (and not already expired) and renewed,
+            False if the hold is unknown or has already expired.
+        """
+        now = time.time()
+        with self._lock:
+            hold = self._holds.get(hold_id)
+            if hold is None:
+                logger.warning(
+                    "HoldRegistry.renew: hold_id=%s not found (never existed, already released, or already expired)",
+                    hold_id,
+                )
+                return False
+            if hold.expires_at < now:
+                # Already expired but not yet purged by list_active(); treat as gone.
+                self._holds.pop(hold_id, None)
+                logger.warning(
+                    "HoldRegistry.renew: hold_id=%s found but already expired at %.1f (now=%.1f) - dropping",
+                    hold_id,
+                    hold.expires_at,
+                    now,
+                )
+                return False
+            new_expires_at = now + hold.ttl_seconds
+            renewed = replace(hold, expires_at=new_expires_at, last_renewed_at=now)
+            self._holds[hold_id] = renewed
+        logger.info(
+            "hold %s renewed, new expires_at=%.1f (ttl_seconds=%.1f, last_renewed_at=%.1f)",
+            hold_id,
+            new_expires_at,
+            renewed.ttl_seconds,
+            now,
+        )
+        return True
+
+    def get(self, hold_id: str) -> Hold | None:
+        """Look up a single hold by id without purging expired entries.
+
+        Returns:
+            The Hold if present (even if technically expired but not yet
+            purged), or None if it was never registered / already released.
+        """
+        with self._lock:
+            hold = self._holds.get(hold_id)
+        logger.info("HoldRegistry.get: hold_id=%s found=%s", hold_id, hold is not None)
+        return hold
 
     def list_active(self) -> list[Hold]:
         """Purge expired holds and return the remaining active ones.
@@ -170,6 +242,16 @@ def acquire_hold(reason: str, ttl_seconds: float = DEFAULT_TTL_SECONDS) -> Hold:
 def release_hold(hold_id: str) -> bool:
     """Release a hold on the module-level singleton registry."""
     return _registry.release(hold_id)
+
+
+def renew_hold(hold_id: str) -> bool:
+    """Heartbeat-renew a hold on the module-level singleton registry."""
+    return _registry.renew(hold_id)
+
+
+def get_hold(hold_id: str) -> Hold | None:
+    """Look up a single hold on the module-level singleton registry."""
+    return _registry.get(hold_id)
 
 
 def list_active_holds() -> list[Hold]:
