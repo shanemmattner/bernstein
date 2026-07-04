@@ -57,8 +57,10 @@ def test_launch_server_writes_pid_and_uses_expected_command(tmp_path: Path) -> N
         pid = server_supervisor._launch_server(state)
 
     assert pid == 222
-    assert (tmp_path / ".sdd" / "runtime" / "server.pid").read_text(encoding="utf-8") == "222"
-    mock_rotate.assert_called_once_with(tmp_path / ".sdd" / "runtime" / "server.log")
+    # Runtime state is namespaced under .sdd/runtime/<port>/ (get_runtime_dir)
+    # so concurrent Bernstein runs on different ports don't collide.
+    assert (tmp_path / ".sdd" / "runtime" / "8052" / "server.pid").read_text(encoding="utf-8") == "222"
+    mock_rotate.assert_called_once_with(tmp_path / ".sdd" / "runtime" / "8052" / "server.log")
     popen_args = mock_popen.call_args.args[0]
     assert popen_args[:3] == [server_supervisor.sys.executable, "-m", "uvicorn"]
     assert "--host" in popen_args

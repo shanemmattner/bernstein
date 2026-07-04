@@ -416,7 +416,9 @@ def _stop_demo_processes(project_dir: Path) -> None:
     Args:
         project_dir: Demo project root whose .sdd/runtime/ holds PID files.
     """
-    runtime_dir = project_dir / ".sdd" / "runtime"
+    # Runtime state is namespaced under .sdd/runtime/<port>/ (see
+    # get_runtime_dir); the demo always bootstraps on _DEMO_PORT.
+    runtime_dir = project_dir / ".sdd" / "runtime" / str(_DEMO_PORT)
     for pid_filename, _label in (
         ("watchdog.pid", "Watchdog"),
         ("spawner.pid", "Spawner"),
@@ -509,6 +511,13 @@ def _print_demo_summary(project_dir: Path, server_url: str, elapsed_secs: float 
     help="Parse recipe, show sprint graph + estimated cost, and exit.",
 )
 @click.option("--port", default=8052, show_default=True, help="Task server port in execution mode.")
+@click.option(
+    "--auto-port",
+    "auto_port",
+    is_flag=True,
+    default=False,
+    help="Auto-assign a free port from the configurable range instead of --port (see 'bernstein conduct --help').",
+)
 @click.option("--cells", default=1, show_default=True, help="Number of cells in execution mode.")
 @click.option("--cli", default=None, help="CLI adapter override (defaults to recipe config or auto).")
 @click.option("--model", default=None, help="Model override for execution.")
@@ -517,6 +526,7 @@ def cook(
     recipe: Path,
     dry_run: bool,
     port: int,
+    auto_port: bool,
     cells: int,
     cli: str | None,
     model: str | None,
@@ -538,6 +548,14 @@ def cook(
         _print_cook_dry_run(recipe_path=recipe, goal=goal, stages=stages, tasks=tasks)
         console.print("\n[dim]Dry-run only. No agents were spawned.[/dim]")
         return
+
+    if auto_port:
+        from bernstein.core.port_alloc import resolve_launch_port
+
+        resolved_port = resolve_launch_port(requested_port=port, auto_port=True)
+        if resolved_port != port:
+            console.print(f"[dim]--auto-port: assigned port {resolved_port}[/dim]")
+        port = resolved_port
 
     selected_cli = cli or plan_config.cli or "auto"
     console.print(

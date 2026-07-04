@@ -30,8 +30,14 @@ def test_ensure_sdd_creates_workspace_and_session_gitignore(tmp_path: Path) -> N
 
 
 def test_clean_stale_runtime_removes_dead_pids_tasks_and_index_locks(tmp_path: Path) -> None:
-    """_clean_stale_runtime removes stale pid files, task logs, and SQLite lock sidecars."""
-    runtime = tmp_path / ".sdd" / "runtime"
+    """_clean_stale_runtime removes stale pid files, task logs, and SQLite lock sidecars.
+
+    Runtime state is namespaced under .sdd/runtime/<port>/ (see
+    get_runtime_dir) so multiple Bernstein runs can execute concurrently
+    against the same repo; _clean_stale_runtime only touches its own port's
+    directory, leaving other running instances' state alone.
+    """
+    runtime = tmp_path / ".sdd" / "runtime" / "8052"
     index_dir = tmp_path / ".sdd" / "index"
     runtime.mkdir(parents=True)
     index_dir.mkdir(parents=True)
@@ -41,7 +47,7 @@ def test_clean_stale_runtime_removes_dead_pids_tasks_and_index_locks(tmp_path: P
     (index_dir / "code.db-shm").write_text("", encoding="utf-8")
 
     with patch("bernstein.core.server.server_launch._is_alive", return_value=False):
-        _clean_stale_runtime(tmp_path)
+        _clean_stale_runtime(tmp_path, 8052)
 
     assert not (runtime / "server.pid").exists()
     assert not (runtime / "tasks.jsonl").exists()

@@ -368,7 +368,7 @@ class TestStopCommand:
         runner = CliRunner()
         with patch("bernstein.cli.stop_cmd.soft_stop") as mock_soft:
             result = runner.invoke(cli, ["stop"])
-            mock_soft.assert_called_once_with(30)
+            mock_soft.assert_called_once_with(30, port=None)
             assert result.exit_code == 0
 
     def test_hard_stop_with_force_flag(self) -> None:
@@ -392,5 +392,5 @@ class TestStopCommand:
         runner = CliRunner()
         with patch("bernstein.cli.stop_cmd.soft_stop") as mock_soft:
             result = runner.invoke(cli, ["stop", "--timeout", "60"])
-            mock_soft.assert_called_once_with(60)
+            mock_soft.assert_called_once_with(60, port=None)
             assert result.exit_code == 0

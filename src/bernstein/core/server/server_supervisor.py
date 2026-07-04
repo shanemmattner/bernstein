@@ -28,7 +28,12 @@ from typing import TYPE_CHECKING
 
 from bernstein.core.platform_compat import kill_process
 from bernstein.core.process_utils import is_process_alive
-from bernstein.core.runtime_state import SupervisorStateSnapshot, rotate_log_file, write_supervisor_state
+from bernstein.core.runtime_state import (
+    SupervisorStateSnapshot,
+    get_runtime_dir,
+    rotate_log_file,
+    write_supervisor_state,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -70,7 +75,7 @@ def supervised_server(
     # Start initial server
     pid = _launch_server(state)
     state.current_pid = pid
-    write_supervisor_state(workdir, state.snapshot())
+    write_supervisor_state(workdir, state.snapshot(), port=port)
 
     # Start supervisor thread (monitors + restarts)
     supervisor = threading.Thread(
@@ -137,7 +142,8 @@ def _launch_server(state: _SupervisorState) -> int:
     port = state.port
     bind_host = state.bind_host
 
-    pid_path = workdir / ".sdd" / "runtime" / "server.pid"
+    runtime_dir = get_runtime_dir(workdir, port)
+    pid_path = runtime_dir / "server.pid"
 
     env = os.environ.copy()
     if state.cluster_enabled:
@@ -170,7 +176,7 @@ def _launch_server(state: _SupervisorState) -> int:
     # uvicorn argv; if you're tempted to re-add --reload, read
     # first.
 
-    log_path = workdir / ".sdd" / "runtime" / "server.log"
+    log_path = runtime_dir / "server.log"
     rotate_log_file(log_path)
     log_fh = log_path.open("a")  # Append on restart, don't overwrite
     proc = subprocess.Popen(
@@ -184,7 +190,7 @@ def _launch_server(state: _SupervisorState) -> int:
     log_fh.close()
     pid_path.write_text(str(proc.pid))
     state.current_pid = proc.pid
-    write_supervisor_state(workdir, state.snapshot())
+    write_supervisor_state(workdir, state.snapshot(), port=port)
     return proc.pid
 
 
@@ -218,9 +224,10 @@ def _supervisor_loop(state: _SupervisorState) -> None:
 
             if len(state.restart_timestamps) >= MAX_RESTARTS:
                 logger.error(
-                    "Server crashed %d times in %ds - giving up. Check .sdd/runtime/server.log for root cause.",
+                    "Server crashed %d times in %ds - giving up. Check .sdd/runtime/%d/server.log for root cause.",
                     MAX_RESTARTS,
                     RESTART_WINDOW_S,
+                    state.port,
                 )
                 state.stopped = True
                 return

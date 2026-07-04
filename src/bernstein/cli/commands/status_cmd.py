@@ -716,23 +716,35 @@ def _doctor_check_workspace(checks: list[dict[str, Any]], workdir: Path) -> None
 
 
 def _doctor_check_stale_pids(checks: list[dict[str, Any]], workdir: Path) -> list[Path]:
-    """Check for stale PID files. Returns list of stale PID file paths."""
+    """Check for stale PID files. Returns list of stale PID file paths.
+
+    Checks both the legacy flat ``.sdd/runtime/`` layout (pre-namespacing
+    runs) and every namespaced ``.sdd/runtime/<port>/`` directory (see
+    ``get_runtime_dir``), so this check stays accurate for runs started
+    with ``--auto-port`` / a non-default ``--port``.
+    """
     stale_pids: list[str] = []
     stale_pid_paths: list[Path] = []
-    for pid_name in ("server.pid", "spawner.pid", "watchdog.pid"):
-        pid_path = workdir / ".sdd" / "runtime" / pid_name
-        if not pid_path.exists():
-            continue
-        try:
-            pid_val = int(pid_path.read_text().strip())
-            from bernstein.core.platform_compat import process_alive
+    runtime_root = workdir / ".sdd" / "runtime"
+    pid_dirs = [runtime_root]
+    if runtime_root.is_dir():
+        pid_dirs.extend(child for child in runtime_root.iterdir() if child.is_dir() and child.name.isdigit())
+    for pid_dir in pid_dirs:
+        for pid_name in ("server.pid", "spawner.pid", "watchdog.pid", "bernstein.pid"):
+            pid_path = pid_dir / pid_name
+            if not pid_path.exists():
+                continue
+            label = f"{pid_dir.name}/{pid_name}" if pid_dir != runtime_root else pid_name
+            try:
+                pid_val = int(pid_path.read_text().strip())
+                from bernstein.core.platform_compat import process_alive
 
-            if not process_alive(pid_val):
-                stale_pids.append(pid_name)
+                if not process_alive(pid_val):
+                    stale_pids.append(label)
+                    stale_pid_paths.append(pid_path)
+            except ValueError:
+                stale_pids.append(label)
                 stale_pid_paths.append(pid_path)
-        except ValueError:
-            stale_pids.append(pid_name)
-            stale_pid_paths.append(pid_path)
     _add_check(
         checks,
         "Stale PID files",

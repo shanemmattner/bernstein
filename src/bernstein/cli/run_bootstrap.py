@@ -870,6 +870,20 @@ def exec_restart() -> None:
     help="Port for the task server.",
 )
 @click.option(
+    "--auto-port",
+    "auto_port",
+    is_flag=True,
+    default=False,
+    help=(
+        "Auto-assign a free port from the configurable range (default "
+        "18000-18999; see 'port_range' in bernstein.yaml or "
+        "BERNSTEIN_PORT_RANGE) instead of --port, and namespace all runtime "
+        "state under .sdd/runtime/<port>/. Lets multiple `bernstein run` "
+        "invocations execute concurrently against the same repo. Off by "
+        "default -- a bare `bernstein run` still binds port 8052 unchanged."
+    ),
+)
+@click.option(
     "--cells",
     default=1,
     show_default=True,
@@ -1217,6 +1231,7 @@ def run(
     goal: str | None,
     seed_file: str | None,
     port: int,
+    auto_port: bool,
     cells: int,
     remote: bool,
     cli: str | None,
@@ -1268,6 +1283,7 @@ def run(
             goal=goal,
             seed_file=seed_file,
             port=port,
+            auto_port=auto_port,
             cells=cells,
             remote=remote,
             cli=cli,
@@ -1319,6 +1335,7 @@ def _run_impl(
     goal: str | None,
     seed_file: str | None,
     port: int,
+    auto_port: bool,
     cells: int,
     remote: bool,
     cli: str | None,
@@ -1553,6 +1570,27 @@ def _run_impl(
         return
 
     workdir = Path.cwd()
+
+    # --auto-port: resolve the actual port to bind to BEFORE anything else
+    # touches .sdd/runtime/ -- everything downstream (server, spawner,
+    # watchdog, singleton PID lock) is namespaced under .sdd/runtime/<port>/
+    # via bernstein.core.persistence.runtime_state.get_runtime_dir, so
+    # resolving early is what lets multiple `bernstein run` invocations
+    # execute concurrently against the same repo. No --auto-port: unchanged
+    # behaviour, `port` stays whatever --port resolved to (default 8052).
+    if auto_port:
+        from bernstein.core.port_alloc import resolve_launch_port
+
+        _seed_path_for_range = Path(seed_file) if seed_file is not None else find_seed_file()
+        resolved_port = resolve_launch_port(
+            requested_port=port,
+            auto_port=True,
+            seed_path=_seed_path_for_range,
+        )
+        if resolved_port != port:
+            console.print(f"[dim]--auto-port: assigned port {resolved_port}[/dim]")
+        port = resolved_port
+
     if not plan_only:
         estimate = _estimate_run_preview(
             workdir=workdir,
@@ -1766,17 +1804,24 @@ def _run_impl(
     show_default=True,
     help="Port for the task server.",
 )
-def start(goal: str | None, seed_file: str, port: int) -> None:
+@click.option(
+    "--auto-port",
+    "auto_port",
+    is_flag=True,
+    default=False,
+    help="Auto-assign a free port from the configurable range instead of --port (see 'bernstein conduct --help').",
+)
+def start(goal: str | None, seed_file: str, port: int, auto_port: bool) -> None:
     """Start server and spawn manager (legacy, use 'conduct')."""
     try:
-        _start_impl(goal, seed_file, port)
+        _start_impl(goal, seed_file, port, auto_port)
     except (click.UsageError, SystemExit):
         raise
     except BaseException as exc:
         handle_first_run_exception(exc, verbose=_is_verbose())
 
 
-def _start_impl(goal: str | None, seed_file: str, port: int) -> None:
+def _start_impl(goal: str | None, seed_file: str, port: int, auto_port: bool = False) -> None:
     """Concrete ``start`` implementation; wrapped by :func:`start` for hinting."""
     print_banner()
 
@@ -1792,6 +1837,15 @@ def _start_impl(goal: str | None, seed_file: str, port: int) -> None:
     from bernstein.core.seed import SeedError
 
     workdir = Path.cwd()
+
+    if auto_port:
+        from bernstein.core.port_alloc import resolve_launch_port
+
+        _seed_path_for_range = Path(seed_file) if seed_file else find_seed_file()
+        resolved_port = resolve_launch_port(requested_port=port, auto_port=True, seed_path=_seed_path_for_range)
+        if resolved_port != port:
+            console.print(f"[dim]--auto-port: assigned port {resolved_port}[/dim]")
+        port = resolved_port
 
     if goal:
         try:

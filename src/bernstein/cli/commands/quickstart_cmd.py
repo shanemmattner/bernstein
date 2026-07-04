@@ -202,7 +202,9 @@ def _stop_quickstart_processes(project_dir: Path) -> None:
     Args:
         project_dir: Quickstart project root whose .sdd/runtime/ holds PID files.
     """
-    runtime_dir = project_dir / ".sdd" / "runtime"
+    # Runtime state is namespaced under .sdd/runtime/<port>/ (see
+    # get_runtime_dir); quickstart always bootstraps on _QUICKSTART_PORT.
+    runtime_dir = project_dir / ".sdd" / "runtime" / str(_QUICKSTART_PORT)
     for pid_filename, _label in (
         ("watchdog.pid", "Watchdog"),
         ("spawner.pid", "Spawner"),

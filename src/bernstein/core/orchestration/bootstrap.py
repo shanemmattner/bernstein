@@ -77,23 +77,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _acquire_pid_lock(workdir: Path) -> None:
-    """Ensure only one Bernstein instance runs per working directory.
+def _acquire_pid_lock(workdir: Path, port: int = 8052) -> None:
+    """Ensure only one Bernstein instance runs per (working directory, port).
 
-    Writes the current PID to ``.sdd/runtime/bernstein.pid``.  If the file
-    already exists and the recorded PID is still alive, raises
-    ``RuntimeError`` to prevent data corruption from concurrent instances.
+    Writes the current PID to ``.sdd/runtime/<port>/bernstein.pid``.  If the
+    file already exists and the recorded PID is still alive, raises
+    ``RuntimeError`` to prevent data corruption from concurrent instances
+    bound to the *same* port. Namespacing this lock by port (rather than a
+    single flat ``.sdd/runtime/bernstein.pid``) is what actually allows
+    multiple Bernstein workflows to run concurrently against the same repo:
+    each port gets its own lock file, its own PID files, and its own logs
+    under ``.sdd/runtime/<port>/`` (see
+    :func:`bernstein.core.persistence.runtime_state.get_runtime_dir`).
 
     The PID file is removed on clean shutdown via :func:`_release_pid_lock`.
 
     Args:
         workdir: Project root directory.
+        port: TCP port this instance is bound to. Defaults to 8052 (the
+            single-run default case is unaffected: same behaviour as
+            before, just at the namespaced path).
 
     Raises:
-        RuntimeError: If another live instance owns the PID file.
+        RuntimeError: If another live instance owns the PID file for *port*.
     """
-    runtime_dir = workdir / ".sdd" / "runtime"
-    runtime_dir.mkdir(parents=True, exist_ok=True)
+    from bernstein.core.persistence.runtime_state import get_runtime_dir
+
+    runtime_dir = get_runtime_dir(workdir, port)
     pid_path = runtime_dir / "bernstein.pid"
 
     if pid_path.exists():
@@ -107,18 +117,20 @@ def _acquire_pid_lock(workdir: Path) -> None:
 
             if process_alive(existing_pid):
                 raise RuntimeError(
-                    f"Another Bernstein instance is running (PID {existing_pid}). "
-                    f"Stop it first with 'bernstein stop' or remove {pid_path}"
+                    f"Another Bernstein instance is running on port {port} (PID {existing_pid}). "
+                    f"Stop it first with 'bernstein stop --port {port}', pick a different --port, "
+                    f"or remove {pid_path}"
                 )
 
+    logger.info("_acquire_pid_lock: acquired lock at %s (pid=%d, port=%d)", pid_path, os.getpid(), port)
     pid_path.write_text(str(os.getpid()))
 
     import atexit
 
-    atexit.register(_release_pid_lock, workdir)
+    atexit.register(_release_pid_lock, workdir, port)
 
 
-def _release_pid_lock(workdir: Path) -> None:
+def _release_pid_lock(workdir: Path, port: int = 8052) -> None:
     """Remove the PID lock file on clean shutdown.
 
     Only removes the file if it still contains our PID (guards against a
@@ -126,8 +138,9 @@ def _release_pid_lock(workdir: Path) -> None:
 
     Args:
         workdir: Project root directory.
+        port: TCP port the exiting instance was bound to.
     """
-    pid_path = workdir / ".sdd" / "runtime" / "bernstein.pid"
+    pid_path = workdir / ".sdd" / "runtime" / str(port) / "bernstein.pid"
     with contextlib.suppress(ValueError, OSError):
         if pid_path.exists() and int(pid_path.read_text().strip()) == os.getpid():
             pid_path.unlink(missing_ok=True)
@@ -526,8 +539,8 @@ def bootstrap_from_seed(
         RuntimeError: If the server fails to start or respond, or if another
             Bernstein instance is already running in this directory.
     """
-    # Singleton guard: prevent two instances on the same workdir
-    _acquire_pid_lock(workdir)
+    # Singleton guard: prevent two instances on the same (workdir, port)
+    _acquire_pid_lock(workdir, port)
 
     # Resolve cluster-aware settings
     bind_host = "0.0.0.0" if remote else _resolve_bind_host()
@@ -565,7 +578,7 @@ def bootstrap_from_seed(
 
     # 2. Workspace + catalog + index (silent - errors logged, not printed)
     ensure_sdd(workdir, model=seed.model)
-    _clean_stale_runtime(workdir)
+    _clean_stale_runtime(workdir, port)
     _discover_catalog(workdir)
     _index_codebase_with_timeout(workdir)
     _check_safety_invariants(workdir)
@@ -601,7 +614,7 @@ def bootstrap_from_seed(
         BernsteinError(
             what=f"Task server on port {port} did not respond within 10.0s",
             why="Server process may have crashed during startup",
-            fix="Check .sdd/runtime/server.log for details",
+            fix=f"Check .sdd/runtime/{port}/server.log for details",
         ).print()
         raise SystemExit(1)
     console.print(f"  [dim]server[/dim]  :{port} [green]ready[/green]")
@@ -706,8 +719,12 @@ def _start_watchdog(
     Returns:
         PID of the watchdog process.
     """
-    pid_path = workdir / ".sdd" / "runtime" / "watchdog.pid"
-    log_path = workdir / ".sdd" / "runtime" / "watchdog.log"
+    from bernstein.core.persistence.runtime_state import get_runtime_dir
+
+    runtime_dir = get_runtime_dir(workdir, port)
+    pid_path = runtime_dir / "watchdog.pid"
+    log_path = runtime_dir / "watchdog.log"
+    logger.debug("_start_watchdog: namespaced pid_path=%s log_path=%s (port=%d)", pid_path, log_path, port)
 
     argv = [
         sys.executable,
@@ -827,8 +844,11 @@ def run_watchdog(
         seed_path: Resolved bernstein.yaml path to preserve across spawner
             restarts.
     """
-    server_pid_path = workdir / ".sdd" / "runtime" / "server.pid"
-    spawner_pid_path = workdir / ".sdd" / "runtime" / "spawner.pid"
+    from bernstein.core.persistence.runtime_state import get_runtime_dir
+
+    _watchdog_runtime_dir = get_runtime_dir(workdir, port)
+    server_pid_path = _watchdog_runtime_dir / "server.pid"
+    spawner_pid_path = _watchdog_runtime_dir / "spawner.pid"
     max_restarts = 5
     restart_reset_after_s = 120.0  # reset counter after this much continuous uptime
     server_restarts = 0
@@ -1071,8 +1091,8 @@ def _bootstrap_from_goal_impl(
     Returns:
         BootstrapResult with PIDs and task ID.
     """
-    # Singleton guard: prevent two instances on the same workdir
-    _acquire_pid_lock(workdir)
+    # Singleton guard: prevent two instances on the same (workdir, port)
+    _acquire_pid_lock(workdir, port)
 
     seed = SeedConfig(goal=goal, cli=cli, model=model)  # type: ignore[arg-type]
 
@@ -1118,7 +1138,7 @@ def _bootstrap_from_goal_impl(
         created = ensure_sdd(workdir, model=model)
         if first_run and not (workdir / "bernstein.yaml").exists():
             auto_write_bernstein_yaml(workdir)
-        _clean_stale_runtime(workdir)
+        _clean_stale_runtime(workdir, port)
     if created:
         console.print(f"[green]{_icons.arrow_right}[/green] Created .sdd/ workspace")
     else:
@@ -1167,7 +1187,7 @@ def _bootstrap_from_goal_impl(
             BernsteinError(
                 what=f"Task server on port {port} did not respond within 10.0s",
                 why="Server process may have crashed during startup",
-                fix="Check .sdd/runtime/server.log for details",
+                fix=f"Check .sdd/runtime/{port}/server.log for details",
             ).print()
             raise SystemExit(1)
     console.print(f"[green]{_icons.arrow_right}[/green] Task server ready (PID {server_pid}, {bind_host}:{port})")
