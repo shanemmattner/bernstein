@@ -2585,10 +2585,39 @@ class AgentSpawner:
             # ``self._adapter=claude``, ``role_policy.provider=qwen``).
             resolved_adapter_name = self._infer_adapter_name_for_provider(provider_name, model_config.model)
             before_model = model_config.model
+            # Resolve the TARGET adapter's own default model, not
+            # ``self._default_model`` (the run-level default, which belongs
+            # to ``self._adapter`` and may be ``None`` or belong to an
+            # entirely different adapter than the one just resolved above).
+            # Passing the wrong default here silently no-ops the coercion
+            # below whenever ``self._default_model`` is falsy, letting a
+            # raw Claude tier name ("opus"/"sonnet"/"haiku") leak through
+            # to a non-Claude adapter. Probe read-only via the registry
+            # factory - a plain constructor call, not
+            # ``_get_adapter_by_name`` (which enforces role_adapter_policy
+            # and writes an audit-log entry as a side effect) - mirroring
+            # ``_primary_adapter_supports_sampling``'s uncached-probe
+            # pattern above. Falls back to ``self._default_model`` only if
+            # the resolved adapter can't be probed (unknown adapter name,
+            # missing optional dependency).
+            try:
+                resolved_adapter_default_model = getattr(
+                    get_adapter(resolved_adapter_name), "default_model", None
+                )
+            except Exception as exc:
+                logger.info(
+                    "Provider-only role_policy coercion: could not probe resolved_adapter=%r "
+                    "for its default_model (%s: %s); falling back to self._default_model=%r",
+                    resolved_adapter_name,
+                    type(exc).__name__,
+                    exc,
+                    self._default_model,
+                )
+                resolved_adapter_default_model = None
             model_config = _coerce_model_for_non_claude_adapter(
                 model_config,
                 adapter_name=resolved_adapter_name,
-                adapter_default_model=self._default_model,
+                adapter_default_model=resolved_adapter_default_model or self._default_model,
             )
             logger.info(
                 "Provider-only role_policy coercion for role=%s: provider=%s -> "
