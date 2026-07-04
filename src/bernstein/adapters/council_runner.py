@@ -80,10 +80,25 @@ class CouncilRunResult:
             ``_extract_usage_tokens``'s existing fallback path sums real
             token usage across the WHOLE council (every candidate that
             actually ran, plus the judge), not just the winner's slice.
+            Retained as a back-compat aggregate fallback; the caller
+            should prefer ``member_usage`` for cost attribution (see
+            below) since pricing the aggregate under a single model id
+            is wrong when candidates use different real models.
+        member_usage: One entry per live candidate plus the judge -
+            ``{"model": <real model id>, "label": <diagnostic label>,
+            "result": <that member's own RunResult-like object>}``. The
+            caller (``openai_agents_runner._run_session``) feeds each
+            entry's ``result`` back through the normal
+            ``_extract_usage_tokens``/``price_model_usage`` path with
+            ``model`` overriding ``manifest.model`` - which would
+            otherwise be the council's ``.yaml`` file path, not a real,
+            priceable model id. This is the fix for council cost
+            tracking metering at $0 under the yaml path.
     """
 
     final_output: str
     raw_responses: list[Any] = dataclasses.field(default_factory=list)
+    member_usage: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
 
 def _resolve_member_client_kwargs(member: dict[str, Any]) -> dict[str, Any]:
@@ -113,13 +128,16 @@ async def _run_candidate(
     prompt: str,
     timeout: float,
     max_turns: int | None,
-) -> tuple[str, Any] | None:
+) -> tuple[str, str, Any] | None:
     """Run one candidate's FULL task to completion, independently.
 
     Returns:
-        ``(label, RunResult)`` on success, or ``None`` when the candidate
-        timed out or raised - the caller excludes it from judging but
-        continues with whatever candidates DID survive.
+        ``(label, model_id, RunResult)`` on success, or ``None`` when the
+        candidate timed out or raised - the caller excludes it from
+        judging but continues with whatever candidates DID survive. The
+        real ``model_id`` (not just the diagnostic ``label`` it's embedded
+        in) is returned separately so the caller can attribute cost
+        accounting to it - see ``CouncilRunResult.member_usage``.
     """
     from agents import OpenAIChatCompletionsModel, Runner  # type: ignore[import-not-found]
     from openai import AsyncOpenAI  # type: ignore[import-not-found]
@@ -175,7 +193,7 @@ async def _run_candidate(
         elapsed,
         output_text,
     )
-    return label, result
+    return label, str(model_id), result
 
 
 async def _run_judge(
@@ -323,7 +341,7 @@ async def _run_council_async(
         ),
     )
 
-    live: list[tuple[str, Any]] = [r for r in candidate_results if r is not None]
+    live: list[tuple[str, str, Any]] = [r for r in candidate_results if r is not None]
     if not live:
         msg = (
             f"run_council: session={manifest.session_id}: all {len(raw_candidates)} "
@@ -339,33 +357,57 @@ async def _run_council_async(
         manifest.session_id,
         len(live),
         len(raw_candidates),
-        [label for label, _ in live],
+        [label for label, _, _ in live],
     )
 
-    candidate_outputs = [(label, str(getattr(result, "final_output", ""))) for label, result in live]
+    candidate_outputs = [
+        (label, str(getattr(result, "final_output", ""))) for label, _model_id, result in live
+    ]
     judge_result = await _run_judge(judge_member, prompt, candidate_outputs, timeout, agent, max_turns)
 
-    # Aggregate cost accounting: concatenate every live candidate's
-    # ``raw_responses`` with the judge's own so the existing
+    # Aggregate cost accounting (back-compat fallback only - see
+    # ``member_usage`` below for the actual fix): concatenate every live
+    # candidate's ``raw_responses`` with the judge's own so the existing
     # ``_extract_usage_tokens`` fallback (which sums ``.usage`` off each
-    # ``raw_responses`` entry - see ``CouncilRunResult`` docstring) prices
-    # the WHOLE council's real spend, not just the judge's slice of it.
+    # ``raw_responses`` entry) still reflects the WHOLE council's real
+    # token spend if a caller reads ``.raw_responses`` directly instead of
+    # ``member_usage``.
     aggregated_raw_responses: list[Any] = []
-    for _, result in live:
+    for _, _model_id, result in live:
         aggregated_raw_responses.extend(getattr(result, "raw_responses", None) or [])
     aggregated_raw_responses.extend(getattr(judge_result, "raw_responses", None) or [])
+
+    # Per-member cost attribution: one entry per live candidate plus the
+    # judge, each carrying its OWN real model id and its OWN result object
+    # - so the caller can price each member under its actual model instead
+    # of the council's ``.yaml`` file path (which is not in the pricing
+    # table and previously metered the whole council at $0). See
+    # ``CouncilRunResult.member_usage`` docstring for the full rationale.
+    member_usage: list[dict[str, Any]] = [
+        {"model": model_id, "label": label, "result": result} for label, model_id, result in live
+    ]
+    judge_model_id = str(judge_member.get("model"))
+    member_usage.append(
+        {"model": judge_model_id, "label": f"judge={judge_model_id}", "result": judge_result},
+    )
 
     final_output = str(getattr(judge_result, "final_output", ""))
     logger.info(
         "run_council: session=%s EXIT - council run complete in %.2fs: %d/%d candidates "
-        "live, %d aggregated raw_responses entries carried forward for usage accounting",
+        "live, %d member_usage entries (candidates+judge) for per-model cost accounting, "
+        "%d aggregated raw_responses entries carried forward as a back-compat fallback",
         manifest.session_id,
         time.monotonic() - started,
         len(live),
         len(raw_candidates),
+        len(member_usage),
         len(aggregated_raw_responses),
     )
-    return CouncilRunResult(final_output=final_output, raw_responses=aggregated_raw_responses)
+    return CouncilRunResult(
+        final_output=final_output,
+        raw_responses=aggregated_raw_responses,
+        member_usage=member_usage,
+    )
 
 
 def run_council(

@@ -14,19 +14,20 @@
 {{/IF}}
 
 ## Instructions
-1. Read the codebase and `.sdd/backlog/open/` before planning to understand current state
+
+**You EXECUTE commands — you do NOT write files.** Every task is created by calling `run_command` with a curl command string. Do not write shell scripts, do not call `write_file`, do not produce plan documents. Your output is API calls, not files.
+
+1. Read the codebase and `.sdd/backlog/open/` using `read_file`/`list_dir` to understand current state
 2. Decompose this goal into tasks of 30-60 min each (max 120 min)
 3. Assign each task the right role; every implementation task needs a paired QA task or inline tests
 4. Set `completion_signals` on every task so the janitor can verify completion
 5. Never assign two tasks to overlapping `owned_files`
-6. Post tasks to the task server, then mark your own task complete
+6. Create each task by calling `run_command` with the curl command below, then mark yourself complete the same way
 
 ## Task creation
 
-The task server requires bearer-token auth - see the `## Task Server Authentication`
-section appended below for the absolute token file path. Every POST needs the
-`Authorization: Bearer $(cat …)` header (or `Authorization: Bearer $BERNSTEIN_AUTH_TOKEN`
-as a fallback).
+The task server requires bearer-token auth — see the `## Task Server Authentication`
+section appended below for the absolute token file path.
 
 **Call form matters.** These commands rely on `$(...)`/`$VAR` shell expansion, which
 only happens when `run_command` is invoked with a single command **STRING**. If
@@ -38,31 +39,15 @@ the token via the `read_file` tool - the token file lives outside your worktree 
 Always inspect the trailing HTTP status code (`-w '\n%{http_code}'` below) and treat
 any non-2xx response as a failure to fix and retry, not as a reason to give up.
 
-```bash
-TOKEN=$(cat <absolute-token-path-from-auth-section>)
-curl -sS -w '\n%{http_code}' -X POST http://127.0.0.1:8052/tasks \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "...",
-    "role": "backend",
-    "description": "...",
-    "priority": 2,
-    "scope": "medium",
-    "complexity": "medium",
-    "owned_files": [...],
-    "completion_signals": [...]
-  }'
-```
+For each task, call `run_command` with this string (adapt title/role/description):
+
+    TOKEN=$(cat <absolute-token-path-from-auth-section>) && curl -sS -w '\n%{http_code}' -X POST http://127.0.0.1:8052/tasks -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"title": "...", "role": "backend", "description": "...", "priority": 2, "scope": "medium", "complexity": "medium", "owned_files": [...], "completion_signals": [...]}'
 
 ## Done signal
-```bash
-TOKEN=$(cat <absolute-token-path-from-auth-section>)
-curl -sS -w '\n%{http_code}' -X POST http://127.0.0.1:8052/tasks/{{TASK_ID}}/complete \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"result_summary": "{{TASK_TITLE}}: created N tasks"}'
-```
+
+When all tasks are created, call `run_command` with this string:
+
+    TOKEN=$(cat <absolute-token-path-from-auth-section>) && curl -sS -w '\n%{http_code}' -X POST http://127.0.0.1:8052/tasks/{{TASK_ID}}/complete -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"result_summary": "{{TASK_TITLE}}: created N tasks"}'
 
 Pass the whole command above to `run_command` as ONE string - never as an argv list -
 and confirm the trailing status code is 2xx before considering the task done.
