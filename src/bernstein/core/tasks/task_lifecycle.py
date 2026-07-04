@@ -525,7 +525,16 @@ def maybe_retry_task(
         "metadata": retry_metadata,
         "meta_messages": list(task.meta_messages),
         "max_output_tokens": task.max_output_tokens,
+        # Carry forward the explicit max_turns override (if any) so a retry
+        # spawn doesn't silently fall back to complexity-based auto-computation.
+        "max_turns": task.max_turns,
     }
+    logger.info(
+        "maybe_retry_task: carrying max_turns=%r forward from task %s to retry %d",
+        task.max_turns,
+        task.id,
+        next_retry,
+    )
 
     try:
         resp = client.post(f"{server_url}/tasks", json=payload)
@@ -1011,7 +1020,17 @@ def retry_or_fail_task(
             "retry_count": retry_count + 1,
             "max_retries": task.max_retries,
             "retry_delay_s": task.retry_delay_s,
+            # Carry forward the explicit max_turns override (if any) so the
+            # retry spawn doesn't silently fall back to complexity-based
+            # auto-computation in compute_max_turns().
+            "max_turns": task.max_turns,
         }
+        logger.info(
+            "retry_or_fail_task: carrying max_turns=%r forward from task %s to retry %d",
+            task.max_turns,
+            task_id,
+            retry_count + 1,
+        )
         # Preserve completion signals on retry
         if task.completion_signals:
             task_body["completion_signals"] = [{"type": s.type, "value": s.value} for s in task.completion_signals]

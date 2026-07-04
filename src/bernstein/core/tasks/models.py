@@ -452,6 +452,11 @@ class Task:
     # that report ``is_multimodal_capable() == False`` MUST refuse spawns
     # carrying a non-empty list before any process is launched.
     attachments: list[str] = field(default_factory=list[str])
+    # Explicit override for compute_max_turns()'s complexity-based auto-computation
+    # (see bernstein.core.agents.claude_max_turns.compute_max_turns). When set,
+    # this value is used verbatim for the Claude adapter's --max-turns flag,
+    # bypassing all scope/complexity-derived math. None = auto-compute as before.
+    max_turns: int | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Task:
@@ -553,6 +558,7 @@ class Task:
             parallel_safe=bool(raw.get("parallel_safe", False)),
             story_id=(str(raw["story_id"]) if raw.get("story_id") else None),
             attachments=_normalize_attachments(raw.get("attachments")),
+            max_turns=(lambda v: None if v is None else int(v))(raw.get("max_turns")),
         )
 
 

@@ -284,6 +284,14 @@ class OpenAIAgentsAdapter(PluginAdapter):
             heartbeat_dir = mcp_config.get("heartbeat_dir")
             if isinstance(heartbeat_dir, str) and heartbeat_dir:
                 overrides["heartbeat_dir"] = heartbeat_dir
+            # Wave 3 (per-agent instrumentation): task id injected by
+            # spawner_core so the runner's RunInstrumenter can write under
+            # .sdd/runs/<run_id>/tasks/<task_id>/agents/<session_id>/.
+            # Absent on hand-written manifests (e.g. direct-invocation
+            # tests) - the runner falls back to "unknown" in that case.
+            task_id = mcp_config.get("task_id")
+            if isinstance(task_id, str) and task_id:
+                overrides["task_id"] = task_id
 
         # ``max_tokens`` from ``mcp_config`` (mode-profile override) wins; the
         # model_config value is only the fallback when the override is absent.

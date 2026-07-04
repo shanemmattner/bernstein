@@ -153,6 +153,10 @@ class TaskCreate(BaseModel):
     terminal_reason: str | None = Field(default=None, max_length=_MAX_DESCRIPTION_LEN)
     max_output_tokens: int | None = None  # Per-task output-token cap (escalated on retry)
     meta_messages: list[str] | None = Field(default=None, max_length=_MAX_LIST_LEN)
+    # Explicit override for compute_max_turns()'s complexity-based auto-computation.
+    # When set, callers get exact control over how many turns a Claude agent spawn
+    # gets, bypassing scope/complexity math entirely (see claude_max_turns.py).
+    max_turns: int | None = None
 
     @field_validator("scope", "complexity", "task_type")
     @classmethod
@@ -252,6 +256,7 @@ class TaskResponse(BaseModel):
     terminal_reason: str | None = None
     max_output_tokens: int | None = None
     meta_messages: list[str] = Field(default_factory=list)
+    max_turns: int | None = None
 
 
 class WebhookTaskResponse(BaseModel):

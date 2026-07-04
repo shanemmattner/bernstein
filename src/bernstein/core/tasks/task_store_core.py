@@ -95,6 +95,9 @@ class TaskRecord(TypedDict):
     max_output_tokens: NotRequired[int | None]
     meta_messages: NotRequired[list[str]]
     metadata: NotRequired[dict[str, Any]]
+    # Explicit compute_max_turns() override (see claude_max_turns.py). Optional
+    # for backward compat with records written before this field existed.
+    max_turns: NotRequired[int | None]
 
 
 class ArchiveRecord(TypedDict):
@@ -195,6 +198,7 @@ class TaskCreateRequest(Protocol):
     retry_delay_s: float | None
     terminal_reason: str | None
     max_output_tokens: int | None
+    max_turns: int | None
 
     @property
     def meta_messages(self) -> Sequence[str] | None: ...
@@ -820,6 +824,7 @@ class TaskStore:
             "max_output_tokens": task.max_output_tokens,
             "meta_messages": list(task.meta_messages),
             "metadata": dict(task.metadata),
+            "max_turns": task.max_turns,
         }
 
     # -- public API ---------------------------------------------------------
@@ -914,6 +919,12 @@ class TaskStore:
         max_retries_raw = getattr(req, "max_retries", None)
         retry_delay_raw = getattr(req, "retry_delay_s", None)
         meta_messages_raw = getattr(req, "meta_messages", None)
+        max_turns_raw = getattr(req, "max_turns", None)
+        logger.info(
+            "TaskStore.create: max_turns=%r for title=%r (None => auto-computed at spawn time)",
+            max_turns_raw,
+            req.title,
+        )
 
         task = Task(
             id=uuid.uuid4().hex[:12],
@@ -951,6 +962,7 @@ class TaskStore:
             terminal_reason=getattr(req, "terminal_reason", None),
             max_output_tokens=getattr(req, "max_output_tokens", None),
             meta_messages=list(meta_messages_raw) if meta_messages_raw is not None else [],
+            max_turns=int(max_turns_raw) if max_turns_raw is not None else None,
         )
         async with self._lock:
             if task.depends_on:

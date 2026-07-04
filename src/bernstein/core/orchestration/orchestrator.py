@@ -500,6 +500,20 @@ class Orchestrator:
         # ``.sdd/cost/ledger.jsonl``.
         run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         self._run_id = run_id
+        # Wave 3 (per-agent instrumentation): export the run id onto the
+        # process environment so it threads through
+        # ``bernstein.adapters.env_isolation.build_filtered_env`` into every
+        # spawned agent subprocess, letting each agent's
+        # ``RunInstrumenter`` (bernstein.core.instrumentation) write its
+        # llm-calls/tool-calls/conversation JSONL under this same
+        # ``.sdd/runs/<run_id>/...`` tree wave 2's timing data lives in.
+        # Best-effort: os.environ writes essentially never fail, but this
+        # must never be allowed to abort orchestrator startup either way.
+        try:
+            os.environ["BERNSTEIN_RUN_ID"] = run_id
+            logger.info("Exported BERNSTEIN_RUN_ID=%s for spawned-agent instrumentation", run_id)
+        except Exception as exc:  # noqa: BLE001 - defensive, must never block startup
+            logger.warning("Failed to export BERNSTEIN_RUN_ID=%s to process env: %s", run_id, exc)
         hard_budget_usd = 0.0
         _raw_hard = os.environ.get("BERNSTEIN_HARD_BUDGET_USD", "").strip()
         if _raw_hard:

@@ -154,6 +154,20 @@ _BASE_ALLOWLIST: frozenset[str] = frozenset(
         # the passthrough set the filtered env drops it and the manager agent's
         # run_command calls fail with ModelBehaviorError: Tool run_command not found.
         "BERNSTEIN_BUILTIN_ALLOW_RUN_COMMAND",
+        # ``BERNSTEIN_RUN_ID`` (wave 3, per-agent instrumentation) is set by
+        # the orchestrator on ``os.environ`` at run start (see
+        # ``Orchestrator.__init__`` right after ``self._run_id`` is
+        # generated) and read back by
+        # ``bernstein.core.instrumentation.init_instrumenter`` /
+        # ``bernstein.adapters.openai_agents_runner.run`` inside the spawned
+        # agent subprocess so its LLM-call/tool-call/conversation JSONL logs
+        # land under the SAME ``.sdd/runs/<run_id>/...`` tree wave 2's
+        # phase/task timing writes to. Without it in the allowlist a
+        # filtered subprocess env silently drops it and every agent falls
+        # back to a literal "unknown" run id, scattering its instrumentation
+        # outside the run it belongs to. It is a plain identifier, not a
+        # credential, so passing it through is safe.
+        "BERNSTEIN_RUN_ID",
     }
 )
 

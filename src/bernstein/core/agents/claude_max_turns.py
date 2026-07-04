@@ -95,6 +95,7 @@ def compute_max_turns(
     timeout_s: int = 1800,
     min_turns: int = 5,
     max_turns_cap: int = 200,
+    explicit_max_turns: int | None = None,
 ) -> MaxTurnsConfig:
     """Compute optimal max_turns based on complexity, model, and timeout.
 
@@ -109,10 +110,25 @@ def compute_max_turns(
         timeout_s: Task timeout in seconds.
         min_turns: Absolute minimum turns.
         max_turns_cap: Absolute maximum turns.
+        explicit_max_turns: When set (e.g. from ``TaskCreate.max_turns``), bypasses
+            all complexity/model/timeout math below and is used verbatim. This lets
+            API callers take exact control over agent turn budgets.
 
     Returns:
-        MaxTurnsConfig with the computed value and reasoning.
+        MaxTurnsConfig with the computed (or explicit) value and reasoning.
     """
+    if explicit_max_turns is not None:
+        logger.info("max_turns=%s (explicit)", explicit_max_turns)
+        return MaxTurnsConfig(
+            max_turns=explicit_max_turns,
+            complexity=complexity,
+            model=model,
+            timeout_s=timeout_s,
+            turns_per_minute=_TURNS_PER_MINUTE.get(_classify_model_tier(model), DEFAULT_TURNS_PER_MINUTE),
+            constrained_by_timeout=False,
+            reasoning=f"Explicit max_turns={explicit_max_turns} supplied by caller; complexity-based computation bypassed.",
+        )
+
     base = _BASE_TURNS.get(complexity, _BASE_TURNS["medium"])
 
     tier = _classify_model_tier(model)

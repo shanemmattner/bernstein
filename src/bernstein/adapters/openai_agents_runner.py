@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import itertools
 import json
 import logging
 import os
@@ -62,10 +63,211 @@ from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 
+from bernstein.core.instrumentation import get_instrumenter, init_instrumenter, resolve_agent_dir
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
+
+# Wave 3 (per-agent instrumentation): monotonically increasing ids for
+# llm-calls.jsonl / tool-calls.jsonl records within this process. Reset per
+# ``run()`` invocation via ``_reset_instrumentation_counters`` so repeated
+# in-process invocations (e.g. tests that call ``run()`` more than once)
+# don't accumulate call ids across sessions.
+_llm_call_counter = itertools.count(1)
+_tool_call_counter = itertools.count(1)
+
+# FIFO of open tool_call starts, keyed by tool name. The SDK's event stream
+# (``tool_call`` then ``tool_result``) carries no call id to correlate the
+# two events, so this assumes same-name tool calls complete in the order
+# they started (true for the synchronous, single-threaded builtin tool
+# implementations wave 3 hooks - see openai_agents_builtins.py). A future
+# wave that makes tool execution concurrent within one turn should have the
+# event source emit an explicit id instead of relying on this ordering
+# assumption (documented as a gap in the wave-3 final report).
+_pending_tool_calls: dict[str, list[dict[str, Any]]] = {}
+
+# Conversation message index, shared across the initial system/user messages
+# logged before the SDK run and the post-hoc turns extracted from the
+# result's ``new_items`` afterwards (see gap note in
+# ``_log_result_conversation_messages``).
+_conversation_idx_counter = itertools.count(0)
+
+
+def _reset_instrumentation_counters() -> None:
+    """Reset per-process instrumentation counters/state (test/re-run hygiene)."""
+    global _llm_call_counter, _tool_call_counter, _conversation_idx_counter
+    _llm_call_counter = itertools.count(1)
+    _tool_call_counter = itertools.count(1)
+    _conversation_idx_counter = itertools.count(0)
+    _pending_tool_calls.clear()
+
+
+def _log_initial_conversation_messages(manifest: RunnerManifest) -> None:
+    """Log the system addendum (if any) and the task prompt as messages 0/1.
+
+    This is the ONLY part of this runner's conversation instrumentation that
+    reflects true real-time message-append order: the openai-agents SDK does
+    not expose its internal, turn-by-turn growing message list to the
+    caller while ``Runner.run_sync`` is executing (it is entirely internal
+    to the SDK's run loop) - only the final accumulated result afterwards.
+    See :func:`_log_result_conversation_messages` for the post-hoc
+    best-effort coverage of what happened during the run, and the wave-3
+    final report for this documented gap.
+    """
+    instrumenter = get_instrumenter()
+    if manifest.system_addendum:
+        instrumenter.log_message(
+            idx=next(_conversation_idx_counter),
+            role="system",
+            content_length=len(manifest.system_addendum),
+        )
+    instrumenter.log_message(
+        idx=next(_conversation_idx_counter),
+        role="user",
+        content_length=len(manifest.prompt),
+    )
+
+
+def _log_result_conversation_messages(result: Any) -> None:
+    """Best-effort post-hoc conversation logging from the SDK's ``RunResult``.
+
+    ``Runner.run_sync`` returns ``new_items`` - the SDK's own list of every
+    item (message, tool call, tool output, ...) generated during the run.
+    Reading it AFTER completion is the only place the accumulated
+    conversation is available at all (see
+    :func:`_log_initial_conversation_messages`'s docstring) - the
+    ``ts`` recorded here is therefore "when we logged it", not "when the SDK
+    actually appended it", and the whole run's turns appear at once rather
+    than incrementally. Every attribute access is defensive (``getattr``
+    with a default) since ``new_items`` element shapes vary by SDK version
+    and item type, and a council run's ``result`` has no ``new_items`` at
+    all (each member's own sub-result is not surfaced here - out of scope
+    for this best-effort pass).
+    """
+    try:
+        new_items = getattr(result, "new_items", None) or []
+    except Exception as exc:  # noqa: BLE001 - defensive, see docstring
+        logger.warning("_log_result_conversation_messages: failed to read new_items: %s", exc)
+        return
+
+    instrumenter = get_instrumenter()
+    for item in new_items:
+        try:
+            raw_item = getattr(item, "raw_item", item)
+            item_type = type(item).__name__
+            role = str(getattr(raw_item, "role", None) or _infer_role_from_item_type(item_type))
+            content = getattr(raw_item, "content", None)
+            tool_name = getattr(raw_item, "name", None)
+            content_length = len(str(content)) if content is not None else len(str(raw_item))
+            instrumenter.log_message(
+                idx=next(_conversation_idx_counter),
+                role=role,
+                content_length=content_length,
+                tool_calls=[str(tool_name)] if tool_name else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - one malformed item must not drop the rest
+            logger.warning("_log_result_conversation_messages: skipped one item (%s): %s", type(item).__name__, exc)
+
+    try:
+        final_output = getattr(result, "final_output", None)
+        if final_output is not None:
+            instrumenter.log_message(
+                idx=next(_conversation_idx_counter),
+                role="assistant",
+                content_length=len(str(final_output)),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_log_result_conversation_messages: failed to log final_output: %s", exc)
+
+
+def _infer_role_from_item_type(item_type: str) -> str:
+    """Map an SDK ``RunItem`` subclass name onto a role label for logging."""
+    lowered = item_type.lower()
+    if "tool" in lowered:
+        return "tool"
+    if "message" in lowered or "output" in lowered:
+        return "assistant"
+    return "unknown"
+
+
+def _instrument_event(event: Mapping[str, Any]) -> None:
+    """Best-effort translation of a runner stdout event into instrumentation records.
+
+    Called from :func:`emit_event` for every event this runner already emits
+    - it never changes what gets written to stdout, only additionally mirrors
+    a subset of events into the active :class:`RunInstrumenter` (a no-op
+    singleton until :func:`bernstein.core.instrumentation.init_instrumenter`
+    has been called, e.g. before any SDK work starts in :func:`run`).
+
+    Wrapped in a broad ``try/except`` so a malformed/unexpected event shape
+    can never break the actual event stream this function is piggybacking
+    on - see module docstring on :mod:`bernstein.core.instrumentation`.
+    """
+    try:
+        event_type = event.get("type")
+        instrumenter = get_instrumenter()
+        now = _now_iso_for_instrumentation()
+
+        if event_type == "usage":
+            call_id = f"c-{next(_llm_call_counter)}"
+            usage_missing = bool(event.get("usage_missing"))
+            instrumenter.log_llm_call(
+                call_id=call_id,
+                ts_start=now,
+                ts_end=now,
+                model=str(event.get("model", "")),
+                prompt_tokens=cast("int | None", event.get("input_tokens")),
+                completion_tokens=cast("int | None", event.get("output_tokens")),
+                status="error" if usage_missing else "ok",
+                error="usage_missing: SDK returned no usable token counts" if usage_missing else None,
+            )
+            # ts_start == ts_end here because the SDK only exposes an
+            # AGGREGATE usage total for the whole session/council-member
+            # (see ``_emit_session_usage``'s docstring), not per-call
+            # wall-clock timing - wall_ms would be fabricated if computed
+            # from these two identical timestamps, so callers reading
+            # llm-calls.jsonl for this adapter should treat wall_ms==0 as
+            # "unknown", not "instant". This is a documented gap - see the
+            # wave-3 final report.
+            return
+
+        if event_type == "tool_call":
+            name = str(event.get("name", "unknown"))
+            call_id = f"tc-{next(_tool_call_counter)}"
+            _pending_tool_calls.setdefault(name, []).append(
+                {"call_id": call_id, "ts_start": now, "args": event.get("args")}
+            )
+            return
+
+        if event_type == "tool_result":
+            name = str(event.get("name", "unknown"))
+            pending_list = _pending_tool_calls.get(name)
+            pending = pending_list.pop(0) if pending_list else None
+            call_id = pending["call_id"] if pending else f"tc-{next(_tool_call_counter)}"
+            ts_start = pending["ts_start"] if pending else now
+            args = pending["args"] if pending else None
+            is_error = bool(event.get("is_error")) or bool(event.get("error"))
+            instrumenter.log_tool_call(
+                call_id=call_id,
+                ts_start=ts_start,
+                ts_end=now,
+                tool=name,
+                args=args if isinstance(args, dict) else {"args": args},
+                success=not is_error,
+                error=str(event.get("error")) if event.get("error") else None,
+            )
+            return
+    except Exception as exc:  # noqa: BLE001 - instrumentation must never break the real event stream
+        logger.warning("_instrument_event failed for event type=%r: %s", event.get("type"), exc)
+
+
+def _now_iso_for_instrumentation() -> str:
+    """Local import-free ISO timestamp helper (mirrors instrumentation._now_iso)."""
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.UTC).isoformat(timespec="milliseconds")
 
 # Exit codes are part of the public contract with the adapter - keep in sync
 # with the module docstring above.
@@ -291,6 +493,13 @@ class RunnerManifest:
     base_url: str | None = None
     api_key_env: str | None = None
     heartbeat_dir: str | None = None
+    # Wave 3 (per-agent instrumentation): Bernstein task id this session is
+    # working, injected by ``spawner_core`` (mirrors ``heartbeat_dir`` -
+    # resolved on the SPAWN side, since the runner has no other way to know
+    # which orchestrator task it belongs to). ``None`` when absent (e.g. a
+    # hand-written manifest for a direct invocation/test) - the runner then
+    # instruments under a literal "unknown" task bucket rather than failing.
+    task_id: str | None = None
     # Control knobs resolved by the SPAWN side. They must travel in the
     # manifest because the spawner hands the runner a filtered environment
     # (env_isolation) that strips BERNSTEIN_* control vars - parent-env
@@ -359,6 +568,12 @@ def emit_event(event: Mapping[str, Any]) -> None:
         line = json.dumps({"type": "error", "message": f"non-serializable event: {exc}"})
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
+    # Wave 3 (per-agent instrumentation): mirror a subset of events
+    # (usage -> llm-calls.jsonl, tool_call/tool_result -> tool-calls.jsonl)
+    # into the active RunInstrumenter. This never changes what was just
+    # written to stdout above - _instrument_event is separately
+    # try/except-wrapped and cannot raise.
+    _instrument_event(event)
 
 
 def load_manifest(path: Path) -> RunnerManifest:
@@ -1174,6 +1389,22 @@ def run(manifest: RunnerManifest) -> int:
     Returns:
         Process exit code.  See module docstring for the contract.
     """
+    # Wave 3 (per-agent instrumentation): stand up this process's
+    # RunInstrumenter before any SDK/event work so every subsequent
+    # emit_event() call (including the "start" event right below) is
+    # eligible for mirroring. run_id comes from the orchestrator via the
+    # BERNSTEIN_RUN_ID env var (threaded through env_isolation's
+    # allowlist); task_id from the manifest (spawner_core-injected, see
+    # spawner_core.py's openai_agents-scoped mcp_config injection);
+    # agent_id is this session's own id. Falls back to literal "unknown"
+    # values rather than failing the run when either is absent (e.g. a
+    # hand-written manifest for a direct-invocation test).
+    _reset_instrumentation_counters()
+    run_id = os.environ.get("BERNSTEIN_RUN_ID", "unknown")
+    task_id = manifest.task_id or "unknown"
+    agent_dir = resolve_agent_dir(Path(manifest.workdir), run_id, task_id, manifest.session_id)
+    init_instrumenter(run_id=run_id, task_id=task_id, agent_id=manifest.session_id, base_dir=agent_dir)
+
     # Every effective sampling/endpoint param is logged here.  The key
     # itself is never logged - only the NAME of the env var that holds it.
     emit_event(
@@ -1448,6 +1679,7 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
         )
         if settings_kwargs:
             agent_kwargs["model_settings"] = sdk.ModelSettings(**settings_kwargs)
+        _log_initial_conversation_messages(manifest)
         agent: Any = agent_cls(**agent_kwargs)
         # No ``run_config`` is passed: the SDK's ``run_config`` kwarg must
         # be a real ``agents.RunConfig`` instance - a plain dict crashes
@@ -1630,6 +1862,11 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
                     type(exc).__name__,
                     exc,
                 )
+
+            # Wave 3 (per-agent instrumentation): log the full conversation
+            # (input items + generated items + final output) from this run
+            # to conversation.jsonl - see _log_result_conversation_messages.
+            _log_result_conversation_messages(result)
     except Exception as exc:  # SDK errors are varied - catch broadly
         # D2 MiniMax attempt-3 (2026-07-03): agents that die on an
         # exception - especially ``MaxTurnsExceeded``, which by definition
