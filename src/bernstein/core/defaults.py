@@ -183,6 +183,24 @@ class SLODefaults:
     error_budget_min_failures: int = 3
 
 
+@dataclass(frozen=True)
+class HoldsDefaults:
+    """Orchestrator hold/release API TTL default and safety bounds.
+
+    See ``bernstein.core.orchestration.holds`` module docstring for the
+    heartbeat-renewed grace-window lease semantics that these values bound.
+    ``min_ttl_seconds``/``max_ttl_seconds`` exist so that a caller (including
+    in-process callers that bypass the FastAPI/Pydantic request validation)
+    cannot wedge the orchestrator open forever with a ``0``, negative, or
+    absurdly large ``ttl_seconds``. Tunable via ``tuning.holds.*`` in
+    ``bernstein.yaml``.
+    """
+
+    default_ttl_seconds: float = 45.0  # grace window before an un-renewed hold auto-expires
+    min_ttl_seconds: float = 5.0  # floor: shorter than this risks flapping on ordinary latency
+    max_ttl_seconds: float = 3600.0  # ceiling: 1 hour - longer defeats the "can't wedge open" guarantee
+
+
 # ---------------------------------------------------------------------------
 # Task defaults
 # ---------------------------------------------------------------------------
@@ -736,6 +754,7 @@ LINEAGE = LineageDefaults()
 REWORK_LEDGER = ReworkLedgerDefaults()
 COMPACTION = CompactionDefaults()
 SLO = SLODefaults()
+HOLDS = HoldsDefaults()
 
 # Module-level constant for direct import - preferred when only the
 # numeric cap is needed (no need to import the whole singleton).
@@ -792,6 +811,7 @@ _SECTION_TO_ATTR: Mapping[str, str] = MappingProxyType(
         "rework_ledger": "REWORK_LEDGER",
         "compaction": "COMPACTION",
         "slo": "SLO",
+        "holds": "HOLDS",
     }
 )
 
@@ -823,6 +843,7 @@ _ATTR_TO_FACTORY: Mapping[str, type[Any]] = MappingProxyType(
         "REWORK_LEDGER": ReworkLedgerDefaults,
         "COMPACTION": CompactionDefaults,
         "SLO": SLODefaults,
+        "HOLDS": HoldsDefaults,
     }
 )
 

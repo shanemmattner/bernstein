@@ -25,11 +25,13 @@ callers that import the singleton directly).
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field, replace
 
+from bernstein.core.defaults import HOLDS
 from bernstein.core.security.sanitize import sanitize_log
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,23 @@ logger = logging.getLogger(__name__)
 # before it is considered abandoned and expires. A short grace window means a
 # crashed/hung driver stops blocking orchestrator self-stop quickly, while a
 # live driver just needs to heartbeat more often than this window.
-DEFAULT_TTL_SECONDS: float = 45.0
+#
+# Value lives in ``bernstein.core.defaults.HoldsDefaults`` (tunable via the
+# ``tuning.holds`` section of bernstein.yaml); re-exported here as a module
+# constant for back-compat with existing importers of
+# ``holds.DEFAULT_TTL_SECONDS``.
+DEFAULT_TTL_SECONDS: float = HOLDS.default_ttl_seconds
+
+# Hard safety bounds on ttl_seconds, enforced in ``_make_hold`` regardless of
+# caller: the HTTP request body validation in
+# ``routes/orchestrator_holds.py`` is not the only entry point - in-process
+# callers that import ``acquire_hold`` directly bypass Pydantic entirely. A
+# ttl of 0/negative would expire the hold before (or as soon as) it's used;
+# an absurdly large ttl (e.g. 1e12) would defeat this module's documented
+# "can't wedge the orchestrator open forever" guarantee. Tunable via
+# ``tuning.holds.min_ttl_seconds`` / ``tuning.holds.max_ttl_seconds``.
+MIN_TTL_SECONDS: float = HOLDS.min_ttl_seconds
+MAX_TTL_SECONDS: float = HOLDS.max_ttl_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +101,33 @@ class Hold:
 
 
 def _make_hold(reason: str, ttl_seconds: float) -> Hold:
+    """Build a new :class:`Hold`, clamping ``ttl_seconds`` to safe bounds.
+
+    Callers (HTTP route, in-process ``acquire_hold``) may pass any float,
+    including ``0``, negative, ``NaN``, or absurdly large values. Clamping
+    here - rather than only at the Pydantic/HTTP boundary - is what makes the
+    module's "can't wedge the orchestrator open forever" guarantee actually
+    hold for in-process callers too.
+    """
+    if math.isnan(ttl_seconds) or ttl_seconds < MIN_TTL_SECONDS:
+        clamped = MIN_TTL_SECONDS
+        logger.warning(
+            "HoldRegistry: ttl_seconds=%r is below MIN_TTL_SECONDS=%.1f (or NaN) - clamping to %.1f",
+            ttl_seconds,
+            MIN_TTL_SECONDS,
+            clamped,
+        )
+        ttl_seconds = clamped
+    elif ttl_seconds > MAX_TTL_SECONDS:
+        clamped = MAX_TTL_SECONDS
+        logger.warning(
+            "HoldRegistry: ttl_seconds=%.1f exceeds MAX_TTL_SECONDS=%.1f - clamping to %.1f",
+            ttl_seconds,
+            MAX_TTL_SECONDS,
+            clamped,
+        )
+        ttl_seconds = clamped
+
     created_at = time.time()
     return Hold(
         id=uuid.uuid4().hex,
@@ -109,10 +154,12 @@ class HoldRegistry:
             ttl_seconds: Grace-window auto-expiry; defaults to
                 DEFAULT_TTL_SECONDS (45s) so a caller that crashes without
                 releasing (and without heartbeating via renew()) doesn't wedge
-                the orchestrator open indefinitely.
+                the orchestrator open indefinitely. Clamped to
+                [MIN_TTL_SECONDS, MAX_TTL_SECONDS] by ``_make_hold``.
 
         Returns:
-            The newly created Hold.
+            The newly created Hold (its ``ttl_seconds`` may differ from the
+            argument if it was out of bounds and got clamped).
         """
         hold = _make_hold(reason, ttl_seconds)
         with self._lock:
@@ -121,7 +168,7 @@ class HoldRegistry:
             "HoldRegistry.acquire: id=%s reason=%r ttl_seconds=%.1f expires_at=%.1f (active_count=%d)",
             hold.id,
             sanitize_log(reason),
-            ttl_seconds,
+            hold.ttl_seconds,
             hold.expires_at,
             len(self._holds),
         )
@@ -151,15 +198,22 @@ class HoldRegistry:
         )
         return True
 
-    def renew(self, hold_id: str) -> bool:
+    def renew(self, hold_id: str) -> Hold | None:
         """Heartbeat-renew a hold, pushing its expiry out by another grace window.
+
+        Computes and returns the renewed :class:`Hold` under the SAME lock
+        acquisition used to do the renewal - callers must not do a separate
+        ``get(hold_id)`` afterward to fetch the "current" hold. A second
+        lookup races a concurrent ``release(hold_id)``: renew succeeds, then
+        the follow-up get 404s because the hold was released in between. This
+        also halves the lock acquisitions on this hot ~15s heartbeat path.
 
         Args:
             hold_id: The id of the hold to renew.
 
         Returns:
-            True if the hold was found (and not already expired) and renewed,
-            False if the hold is unknown or has already expired.
+            The renewed Hold if it was found and not already expired, or
+            None if the hold is unknown or has already expired.
         """
         now = time.time()
         with self._lock:
@@ -169,7 +223,7 @@ class HoldRegistry:
                     "HoldRegistry.renew: hold_id=%s not found (never existed, already released, or already expired)",
                     sanitize_log(hold_id),
                 )
-                return False
+                return None
             if hold.expires_at < now:
                 # Already expired but not yet purged by list_active(); treat as gone.
                 self._holds.pop(hold_id, None)
@@ -179,7 +233,7 @@ class HoldRegistry:
                     hold.expires_at,
                     now,
                 )
-                return False
+                return None
             new_expires_at = now + hold.ttl_seconds
             renewed = replace(hold, expires_at=new_expires_at, last_renewed_at=now)
             self._holds[hold_id] = renewed
@@ -190,7 +244,7 @@ class HoldRegistry:
             renewed.ttl_seconds,
             now,
         )
-        return True
+        return renewed
 
     def get(self, hold_id: str) -> Hold | None:
         """Look up a single hold by id without purging expired entries.
@@ -248,8 +302,11 @@ def release_hold(hold_id: str) -> bool:
     return _registry.release(hold_id)
 
 
-def renew_hold(hold_id: str) -> bool:
-    """Heartbeat-renew a hold on the module-level singleton registry."""
+def renew_hold(hold_id: str) -> Hold | None:
+    """Heartbeat-renew a hold on the module-level singleton registry.
+
+    Returns the renewed Hold, or None if it was unknown/already expired.
+    """
     return _registry.renew(hold_id)
 
 

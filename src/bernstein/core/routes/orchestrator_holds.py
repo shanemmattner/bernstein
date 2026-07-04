@@ -15,7 +15,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from bernstein.core.orchestration.holds import acquire_hold, get_hold, list_active_holds, release_hold, renew_hold
+from bernstein.core.orchestration.holds import acquire_hold, list_active_holds, release_hold, renew_hold
 from bernstein.core.security.sanitize import sanitize_log
 
 logger = logging.getLogger(__name__)
@@ -105,16 +105,14 @@ def delete_hold(hold_id: str) -> dict[str, bool]:
 def renew_hold_endpoint(hold_id: str) -> HoldResponse:
     """Heartbeat-renew a hold, extending its expiry by another grace window."""
     logger.info("POST /orchestrator/holds/%s/renew", sanitize_log(hold_id))
-    renewed = renew_hold(hold_id)
-    if not renewed:
-        logger.warning("POST /orchestrator/holds/%s/renew: not found or already expired", sanitize_log(hold_id))
-        raise HTTPException(status_code=404, detail=f"Hold {hold_id} not found")
-    hold = get_hold(hold_id)
+    # renew_hold now returns the renewed Hold directly (computed under the
+    # same lock as the renewal), instead of a bool that forced a second,
+    # separately-locked get_hold() lookup. The old two-step pattern raced a
+    # concurrent release_hold(): renew succeeds, then the follow-up lookup
+    # 404s because the hold was released in between.
+    hold = renew_hold(hold_id)
     if hold is None:
-        # Should not happen (renew() just succeeded), but guard defensively.
-        logger.error(
-            "POST /orchestrator/holds/%s/renew: renew succeeded but get_hold returned None", sanitize_log(hold_id)
-        )
+        logger.warning("POST /orchestrator/holds/%s/renew: not found or already expired", sanitize_log(hold_id))
         raise HTTPException(status_code=404, detail=f"Hold {hold_id} not found")
     logger.info(
         "POST /orchestrator/holds/%s/renew: success, new expires_at=%.1f",
