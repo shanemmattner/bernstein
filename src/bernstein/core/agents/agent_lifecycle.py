@@ -840,6 +840,27 @@ def _requeue_rate_limited_task(
     return True
 
 
+def _resolve_agent_worktree_dir(workdir: Path, session: AgentSession) -> Path | None:
+    """Find the agent's worktree directory across every layout this codebase supports.
+
+    Checks the current default layout (``.sdd/runtime/worktrees/<id>``) first,
+    then the legacy layout (``.sdd/worktrees/<id>``). Returns ``None`` when
+    neither exists -- e.g. worktrees are disabled entirely and the agent runs
+    directly against ``workdir`` with no per-task worktree at all. Callers
+    must handle the ``None`` case with their own root-level fallback rather
+    than assuming a worktree always exists (see the liveness-probe FAIL-NOTE:
+    hardcoding only the legacy ``.sdd/worktrees/<id>`` layout misjudged a
+    live agent running under either alternate layout as dead).
+    """
+    for _wt_dir in (
+        workdir / ".sdd" / "runtime" / "worktrees" / session.id,
+        workdir / ".sdd" / "worktrees" / session.id,
+    ):
+        if _wt_dir.exists():
+            return _wt_dir
+    return None
+
+
 def _resolve_agent_log_path(workdir: Path, session: AgentSession) -> Path:
     """Find the agent's log file, checking session attribute then standard locations."""
     _session_lp = getattr(session, "log_path", "")
@@ -847,9 +868,11 @@ def _resolve_agent_log_path(workdir: Path, session: AgentSession) -> Path:
         return Path(_session_lp)
     log_path = workdir / ".sdd" / "runtime" / f"{session.id}.log"
     if not log_path.exists():
-        _wt_log = workdir / ".sdd" / "worktrees" / session.id / ".sdd" / "runtime" / f"{session.id}.log"
-        if _wt_log.exists():
-            return _wt_log
+        _wt_dir = _resolve_agent_worktree_dir(workdir, session)
+        if _wt_dir is not None:
+            _wt_log = _wt_dir / ".sdd" / "runtime" / f"{session.id}.log"
+            if _wt_log.exists():
+                return _wt_log
     return log_path
 
 
@@ -901,16 +924,30 @@ def _read_runner_cost_usd(
     except OSError:
         return 0.0, 0, 0
 
-    for line in raw.splitlines():
+    for line_num, line in enumerate(raw.splitlines(), 1):
         line = line.strip()
         if not line:
             continue
         try:
             rec = json.loads(line)
-        except ValueError:
+            total_in += int(rec.get("in", 0) or 0)
+            total_out += int(rec.get("out", 0) or 0)
+        except (ValueError, TypeError, AttributeError) as exc:
+            # Widened beyond just the json.loads() parse: a well-formed-but-
+            # wrong-shape record (not a dict, or "in"/"out" not coercible to
+            # int) raises on the SUBSEQUENT .get()/int() calls, not on
+            # json.loads() itself. This is read on the failure-recovery path
+            # for a dead agent, so a malformed record is realistic input --
+            # skip it and keep summing the rest rather than aborting cost
+            # recovery for the whole task.
+            logger.debug(
+                "Skipping malformed .tokens sidecar record at %s:%d: %s - line=%s",
+                sidecar_path,
+                line_num,
+                exc,
+                line[:500],
+            )
             continue
-        total_in += int(rec.get("in", 0) or 0)
-        total_out += int(rec.get("out", 0) or 0)
 
     if total_in <= 0 and total_out <= 0:
         return 0.0, 0, 0
@@ -1325,10 +1362,17 @@ def _probe_liveness_signals(orch: Any, session: AgentSession, now: float) -> dic
     heartbeat_path = orch._workdir / ".sdd" / "runtime" / "heartbeats" / f"{session.id}.json"
     heartbeat_age = _mtime_age(heartbeat_path, now)
 
-    log_path = orch._workdir / ".sdd" / "worktrees" / session.id / ".sdd" / "runtime" / f"{session.id}.log"
+    # Resolve log/git paths across every layout this codebase supports
+    # (.sdd/runtime/worktrees/<id>/..., legacy .sdd/worktrees/<id>/..., and
+    # the root .sdd/runtime/<id>.log fallback when worktrees are disabled
+    # entirely) rather than hardcoding the legacy worktree layout -- a live
+    # agent running under either alternate layout was previously misjudged
+    # dead (and then killed/reaped) by this probe.
+    log_path = _resolve_agent_log_path(orch._workdir, session)
     log_age = _mtime_age(log_path, now)
 
-    git_path = orch._workdir / ".sdd" / "worktrees" / session.id / ".git"
+    _wt_dir = _resolve_agent_worktree_dir(orch._workdir, session)
+    git_path = (_wt_dir / ".git") if _wt_dir is not None else (orch._workdir / ".git")
     git_age = _mtime_age(git_path, now)
 
     fresh_ages = [a for a in (heartbeat_age, log_age, git_age) if a is not None and a < _ORPHAN_LIVENESS_GRACE_S]
