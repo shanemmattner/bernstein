@@ -374,6 +374,18 @@ class Orchestrator:
         # ``_generate_run_summary`` on this counter reaching zero.
         self._pending_post_complete_count: int = 0
         self._post_complete_seen_task_ids: set[str] = set()
+        # Bug fix (2026-07-04): tracks "process_completed_tasks has started
+        # the chain for this task id" independently of the FIFO-bounded
+        # ``_processed_done_tasks`` cache (see agent_lifecycle.py's
+        # ``_MAX_PROCESSED_DONE`` eviction). If a "seen" task's id falls out
+        # of that bounded cache before its drain is confirmed,
+        # ``_refresh_drain_tracker`` would otherwise treat it as "chain
+        # never started" forever and ``_pending_post_complete_count`` would
+        # wedge permanently above zero - blocking the summary gate for the
+        # rest of a long-running session. This set is not FIFO-bounded;
+        # entries are removed only when the drain is confirmed or the task
+        # is reopened for another janitor cycle, so it stays small.
+        self._post_complete_chain_started: set[str] = set()
         self._run_start_ts: float = time.time()
         self._agent_failure_timestamps: dict[str, float] = {}  # adapter_name -> last failure ts
         self._shutting_down = threading.Event()
@@ -1953,7 +1965,21 @@ class Orchestrator:
                 if settled is not None:
                     settled_open = len(settled["open"])
                     settled_agents = sum(1 for a in self._agents.values() if a.status != "dead")
-                    if settled_open == settled_agents == 0:
+                    # Bug fix (2026-07-04): liveness count over ``_agents`` is
+                    # a proxy for "no work left," not a guarantee that the
+                    # post-/complete drain chain has finished. ``_agents`` is
+                    # a FIFO-capped cache (see purge_dead_agents /
+                    # _MAX_DEAD_AGENTS_KEPT) - a dead agent can be evicted
+                    # from it before its post-complete chain (background
+                    # async work triggered by task completion) finishes,
+                    # making ``settled_agents`` read 0 while drain work is
+                    # still pending. Gate explicitly on
+                    # ``_pending_post_complete_count == 0`` in addition to
+                    # the liveness counts so the orchestrator cannot
+                    # self-stop (and skip ``_generate_run_summary``) while
+                    # post-complete work is still in flight, regardless of
+                    # what the liveness count says.
+                    if settled_open == settled_agents == 0 and self._pending_post_complete_count == 0:
                         # Hold/release API (supplements the settle-timer
                         # self-stop above): external callers can call
                         # POST /orchestrator/holds to keep this orchestrator
@@ -1984,22 +2010,25 @@ class Orchestrator:
                         else:
                             logger.info(
                                 "Quiescence confirmed after %.1fs settle window (tick #%d, "
-                                "open=%d agents=%d, no active holds) - self-stopping",
+                                "open=%d agents=%d pending_post_complete=%d, no active holds) "
+                                "- self-stopping",
                                 _settle_s,
                                 self._tick_count,
                                 settled_open,
                                 settled_agents,
+                                self._pending_post_complete_count,
                             )
                             self._regenerate_final_retrospective(trigger_path="tick-quiescence-self-stop")
                             self._running = False
                     else:
                         logger.info(
                             "Quiescence NOT confirmed after %.1fs settle window (tick #%d): "
-                            "open=%d agents=%d - run continues",
+                            "open=%d agents=%d pending_post_complete=%d - run continues",
                             _settle_s,
                             self._tick_count,
                             settled_open,
                             settled_agents,
+                            self._pending_post_complete_count,
                         )
 
         # 9. Log summary
@@ -3056,6 +3085,13 @@ class Orchestrator:
             if session:
                 with contextlib.suppress(Exception):
                     self._spawner.kill(session)
+                # Bug fix (2026-07-04): reap the session's backgrounded
+                # heartbeat loop on every forced kill, not just the two
+                # stall-kill paths inside heartbeat.py (Defect-10).
+                with contextlib.suppress(Exception):
+                    from bernstein.core.agents.heartbeat import _reap_session_heartbeat_loop
+
+                    _reap_session_heartbeat_loop(self, session, reason="anomaly_kill_agent")
         elif signal.action == "stop_spawning":
             logger.warning("Anomaly [%s]: %s - stopping new spawns", signal.rule, signal.message)
             self._stop_spawning = True
@@ -3325,6 +3361,12 @@ class Orchestrator:
 
         with contextlib.suppress(Exception):
             self._spawner.kill(session)
+        # Bug fix (2026-07-04): reap the heartbeat loop on every forced kill
+        # (see _handle_anomaly_signal for full rationale).
+        with contextlib.suppress(Exception):
+            from bernstein.core.agents.heartbeat import _reap_session_heartbeat_loop
+
+            _reap_session_heartbeat_loop(self, session, reason="cost_cap_kill")
 
         from bernstein.core.lifecycle import transition_agent
 
@@ -3435,6 +3477,12 @@ class Orchestrator:
             self._budget_stop_killed_agents.add(session.id)
             with contextlib.suppress(Exception):
                 self._spawner.kill(session)
+            # Bug fix (2026-07-04): reap the heartbeat loop on every forced
+            # kill (see _handle_anomaly_signal for full rationale).
+            with contextlib.suppress(Exception):
+                from bernstein.core.agents.heartbeat import _reap_session_heartbeat_loop
+
+                _reap_session_heartbeat_loop(self, session, reason="budget_killswitch")
         self._post_bulletin(
             "alert",
             f"budget.exhaust: SIGKILLed {len(pending_kill)} agent(s) after "
@@ -4188,8 +4236,20 @@ class Orchestrator:
 
         # Decrement for tasks whose chain has fully drained. We iterate over
         # a snapshot because we mutate the set below.
+        #
+        # Bug fix (2026-07-04): "has the chain started" used to be answered
+        # by ``tid in self._processed_done_tasks`` alone, but that dict is
+        # FIFO-capped (agent_lifecycle.py evicts oldest entries once it
+        # exceeds ``_MAX_PROCESSED_DONE``). On a long-running session with
+        # many completions, a task's id could be evicted from that cache
+        # before its session went dead - permanently misread as "chain
+        # never started" and wedging ``_pending_post_complete_count`` above
+        # zero forever. ``self._post_complete_chain_started`` mirrors the
+        # same start/clear lifecycle as ``_processed_done_tasks`` (populated
+        # in ``process_completed_tasks``, cleared on janitor reopen) but is
+        # never FIFO-evicted, so it stays a reliable source of truth here.
         for tid in list(self._post_complete_seen_task_ids):
-            if tid not in self._processed_done_tasks:
+            if tid not in self._processed_done_tasks and tid not in self._post_complete_chain_started:
                 # process_completed_tasks hasn't started the chain for this
                 # task yet (e.g. auto-complete-by-reap happened in this tick
                 # AFTER process_completed_tasks ran). Leave the counter alone.
@@ -4198,6 +4258,7 @@ class Orchestrator:
             if session is None or session.status == "dead":
                 self._pending_post_complete_count -= 1
                 self._post_complete_seen_task_ids.discard(tid)
+                self._post_complete_chain_started.discard(tid)
 
         return self._pending_post_complete_count
 
