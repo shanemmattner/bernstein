@@ -15,11 +15,22 @@ is observing (see ``.claude/rules/lessons.md`` rule 2: "logging IS the
 debugging interface", and the corollary that observability code itself must
 be maximally defensive).
 
-Output layout (one directory per agent, created on first write)::
+Pluggable backends (see ``work/bernstein/sqlite-run-storage-design.md``):
+``RunInstrumenter`` is a thin facade that computes/normalizes derived fields
+(``wall_ms``, truncation, defaulted ``total_tokens``) once, then delegates the
+actual write to an :class:`InstrumenterBackend`. Two backends ship today:
 
-    .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/llm-calls.jsonl
-    .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/tool-calls.jsonl
-    .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/conversation.jsonl
+* :class:`JSONLInstrumenterBackend` - the original file-per-stream format,
+  unchanged byte-for-byte from the pre-refactor implementation::
+
+      .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/llm-calls.jsonl
+      .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/tool-calls.jsonl
+      .sdd/runs/<run_id>/tasks/<task_id>/agents/<agent_id>/conversation.jsonl
+
+* :class:`SQLiteInstrumenterBackend` - a single ``run.db`` (WAL mode,
+  foreign keys on) written under the same ``base_dir`` the caller already
+  resolves (today: ``.../agents/<agent_id>/run.db``). Selected via
+  ``init_instrumenter(..., backend="sqlite")`` - the default.
 
 Design choice - module-level singleton, not a class threaded through every
 call site: the two hook points wired up in wave 3
@@ -42,8 +53,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import threading
-from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -88,6 +100,10 @@ _TOOL_RESULT_TRUNCATE_CHARS = 1000
 _SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]")
 _MAX_COMPONENT_CHARS = 128
 _FALLBACK_COMPONENT = "unknown"
+
+# Default backend for init_instrumenter() - see backend-selection log lines
+# below for the "which backend did this process actually get" answer.
+_DEFAULT_BACKEND = "sqlite"
 
 
 def _sanitize_path_component(value: str) -> str:
@@ -144,20 +160,138 @@ def _truncate_value(value: Any, *, max_chars: int = _ARG_VALUE_TRUNCATE_CHARS) -
     return _truncate_value(text, max_chars=max_chars)
 
 
-@dataclass
-class RunInstrumenter:
-    """Appends JSONL instrumentation records for one agent's run.
+def _truncate_text(value: Any, *, max_chars: int, field_name: str, key: str) -> str | None:
+    """Best-effort stringify + truncate a single value for a flat text field.
 
-    One instance is expected per (run_id, task_id, agent_id) triple - i.e.
-    per agent process/session. All three JSONL files live under
-    ``base_dir`` (already resolved to
-    ``.../agents/<agent_id>/`` by the caller - see :func:`init_instrumenter`
-    and :func:`for_agent`).
+    Unlike :func:`_truncate_value` (which recurses into dict/list structures
+    for tool-call *args*), this is for a single flat text field - tool
+    *results* and conversation message *content* - which may arrive as
+    arbitrary objects (SDK response items, exceptions, etc.) and must always
+    degrade to a string rather than raise. Returns ``None`` when ``value``
+    is ``None`` (nothing to log) so callers can omit the key entirely rather
+    than writing a misleading ``"content": "None"`` line/column.
 
-    Every public method is defensive: a failure to create the directory or
-    write a line is logged at WARNING and swallowed, never raised, so a full
-    disk / permissions problem / serialization bug can never take down the
-    agent run being observed.
+    Logs at DEBUG whenever truncation actually happens, with the original
+    and truncated lengths, per the "log every truncation" instrumentation
+    rule. This is shared by every backend since truncation policy is a
+    serialization-time concern, independent of the sink (file vs DB).
+    """
+    if value is None:
+        return None
+    try:
+        text = value if isinstance(value, str) else str(value)
+    except Exception as exc:  # pragma: no cover - defensive, str() essentially never raises
+        logger.debug(
+            "RunInstrumenter: failed to stringify %s for %s=%s: %s", field_name, field_name, sanitize_log(key), exc
+        )
+        return "<unrepr-able value>"
+    if len(text) > max_chars:
+        logger.debug(
+            "RunInstrumenter: truncating %s for %s=%s from %d chars to %d chars",
+            field_name,
+            field_name,
+            sanitize_log(key),
+            len(text),
+            max_chars,
+        )
+        return text[:max_chars] + _TRUNCATE_MARKER
+    return text
+
+
+def _iso_delta_ms(ts_start: str, ts_end: str) -> float | None:
+    """Best-effort millisecond delta between two ISO-8601 timestamps.
+
+    Returns ``None`` (never raises, never fabricates a value) when either
+    timestamp fails to parse.
+    """
+    try:
+        start = datetime.fromisoformat(ts_start)
+        end = datetime.fromisoformat(ts_end)
+        return (end - start).total_seconds() * 1000.0
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Pluggable backend interface
+# ---------------------------------------------------------------------------
+
+
+class InstrumenterBackend(ABC):
+    """Sink for instrumentation records - one instance per (set of) target dir(s).
+
+    ``RunInstrumenter`` (the facade) computes derived fields (``wall_ms``,
+    defaulted ``total_tokens``, truncated args/result/content) once and
+    delegates the actual write to a backend implementation. Every method
+    must be safe to call at high frequency and must never raise -
+    implementations are still expected to catch their own errors (SQLite
+    exceptions, disk I/O errors) and log+swallow, matching the facade's own
+    defensive posture, since a backend bug must not propagate up into the
+    calling agent process either.
+    """
+
+    @abstractmethod
+    def log_llm_call(
+        self,
+        *,
+        call_id: str,
+        ts_start: str,
+        ts_end: str,
+        wall_ms: float | None,
+        model: str,
+        endpoint: str | None,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        total_tokens: int | None,
+        status: str,
+        error: str | None,
+        ts_ttft: str | None = None,
+        tokens_per_sec: float | None = None,
+    ) -> None:
+        """Record one LLM API call."""
+
+    @abstractmethod
+    def log_tool_call(
+        self,
+        *,
+        call_id: str,
+        ts_start: str,
+        ts_end: str,
+        wall_ms: float | None,
+        tool: str,
+        args: dict[str, Any],
+        result: str | None,
+        success: bool,
+        error: str | None,
+    ) -> None:
+        """Record one tool invocation. ``args``/``result`` are already truncated."""
+
+    @abstractmethod
+    def log_message(
+        self,
+        *,
+        idx: int,
+        role: str,
+        content: str | None,
+        content_length: int,
+        ts: str,
+        tool_calls: list[str] | None = None,
+    ) -> None:
+        """Record one conversation message. ``content`` is already truncated."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Flush/cleanup any open resources (file handles, DB connections)."""
+
+
+class JSONLInstrumenterBackend(InstrumenterBackend):
+    """Appends JSONL instrumentation records - the original, pre-refactor format.
+
+    One directory per agent, created on first write; three files
+    (``llm-calls.jsonl``, ``tool-calls.jsonl``, ``conversation.jsonl``)
+    appended to with one ``write()`` call per record. Extracted verbatim
+    from the original :class:`RunInstrumenter` implementation - same file
+    names, same paths, same line format as before this refactor.
 
     ``extra_dirs`` (Bug fix, instrumentation audit bug 3): when this agent
     process is working a BATCH of tasks in one session (see
@@ -168,21 +302,36 @@ class RunInstrumenter:
     an empty list (no fan-out) for the common single-task case.
     """
 
-    run_id: str
-    task_id: str
-    agent_id: str
-    base_dir: Path
-    extra_dirs: list[Path] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        agent_id: str,
+        base_dir: Path,
+        extra_dirs: list[Path] | None = None,
+    ) -> None:
+        self.run_id = run_id
+        self.task_id = task_id
+        self.agent_id = agent_id
+        self.base_dir = Path(base_dir)
+        self.extra_dirs = [Path(d) for d in (extra_dirs or [])]
         self._lock = threading.Lock()
         self._dir_ready = False
-        self._extra_dirs_ready: list[Path] = []
+        self._ready_extra_dirs: list[Path] = []
+        logger.debug(
+            "JSONLInstrumenterBackend: initializing run_id=%s task_id=%s agent_id=%s base_dir=%s extra_dirs=%s",
+            sanitize_log(self.run_id),
+            sanitize_log(self.task_id),
+            sanitize_log(self.agent_id),
+            self.base_dir,
+            self.extra_dirs,
+        )
         try:
             self.base_dir.mkdir(parents=True, exist_ok=True)
             self._dir_ready = True
             logger.info(
-                "RunInstrumenter initialized run_id=%s task_id=%s agent_id=%s -> "
+                "JSONLInstrumenterBackend ready run_id=%s task_id=%s agent_id=%s -> "
                 "llm_calls=%s tool_calls=%s conversation=%s",
                 sanitize_log(self.run_id),
                 sanitize_log(self.task_id),
@@ -193,7 +342,7 @@ class RunInstrumenter:
             )
         except OSError as exc:
             logger.warning(
-                "RunInstrumenter: failed to create instrumentation dir %s (run_id=%s "
+                "JSONLInstrumenterBackend: failed to create instrumentation dir %s (run_id=%s "
                 "task_id=%s agent_id=%s): %s - instrumentation for this agent is "
                 "DISABLED, the agent run itself is unaffected",
                 self.base_dir,
@@ -202,35 +351,49 @@ class RunInstrumenter:
                 sanitize_log(self.agent_id),
                 exc,
             )
+        for extra_dir in self.extra_dirs:
+            if extra_dir == self.base_dir:
+                continue
+            try:
+                extra_dir.mkdir(parents=True, exist_ok=True)
+                self._ready_extra_dirs.append(extra_dir)
+                logger.info(
+                    "JSONLInstrumenterBackend: fanning out run_id=%s task_id=%s agent_id=%s to EXTRA "
+                    "batch-mate dir %s (batched-task instrumentation fix)",
+                    sanitize_log(self.run_id),
+                    sanitize_log(self.task_id),
+                    sanitize_log(self.agent_id),
+                    extra_dir,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "JSONLInstrumenterBackend: failed to create EXTRA instrumentation dir %s "
+                    "(run_id=%s task_id=%s agent_id=%s): %s - this batch-mate task will "
+                    "still have zero instrumentation",
+                    extra_dir,
+                    sanitize_log(self.run_id),
+                    sanitize_log(self.task_id),
+                    sanitize_log(self.agent_id),
+                    exc,
+                )
         if self.extra_dirs:
-            for extra_dir in self.extra_dirs:
-                try:
-                    extra_dir.mkdir(parents=True, exist_ok=True)
-                    self._extra_dirs_ready.append(extra_dir)
-                except OSError as exc:
-                    logger.warning(
-                        "RunInstrumenter: failed to create extra (batch fan-out) "
-                        "instrumentation dir %s (run_id=%s task_id=%s agent_id=%s): %s - "
-                        "fan-out to this dir is DISABLED, other dirs and the agent run "
-                        "are unaffected",
-                        extra_dir,
-                        sanitize_log(self.run_id),
-                        sanitize_log(self.task_id),
-                        sanitize_log(self.agent_id),
-                        exc,
-                    )
             logger.info(
-                "RunInstrumenter: batch fan-out enabled for run_id=%s task_id=%s agent_id=%s -> "
+                "JSONLInstrumenterBackend: batch fan-out enabled for run_id=%s task_id=%s agent_id=%s -> "
                 "%d/%d extra dir(s) ready: %s",
                 sanitize_log(self.run_id),
                 sanitize_log(self.task_id),
                 sanitize_log(self.agent_id),
-                len(self._extra_dirs_ready),
+                len(self._ready_extra_dirs),
                 len(self.extra_dirs),
-                self._extra_dirs_ready,
+                self._ready_extra_dirs,
             )
 
     # -- path helpers ---------------------------------------------------
+
+    def _all_base_dirs(self) -> list[Path]:
+        if self._dir_ready:
+            return [self.base_dir, *self._ready_extra_dirs]
+        return list(self._ready_extra_dirs)
 
     def _llm_calls_path(self) -> Path:
         return self.base_dir / "llm-calls.jsonl"
@@ -252,39 +415,554 @@ class RunInstrumenter:
         heartbeat thread and the main thread); separate agent PROCESSES
         never share a base_dir so no cross-process lock is needed.
 
-        ``path`` is expected to be ``self.base_dir / <filename>``; when
-        ``extra_dirs`` (batch fan-out) is non-empty, the same record is also
-        appended to ``<extra_dir> / <same filename>`` for every ready extra
-        dir, so every task in a batch sees the full record stream.
+        ``path`` is expected to be ``self.base_dir / <filename>``; when this
+        backend was constructed with ``extra_dirs`` (batched tasks, see the
+        module/class docstring), the SAME line is additionally appended to
+        each batch-mate's copy of ``path.name`` under its own ready extra
+        dir, so every task in the batch ends up with a full, independent set
+        of JSONL files instead of only the first task.
         """
-        if not self._dir_ready:
+        targets = [d / path.name for d in self._all_base_dirs()]
+        if not targets:
+            logger.debug(
+                "JSONLInstrumenterBackend: dropping %s record %s=%s - no ready instrumentation dir "
+                "(dir creation failed or backend uninitialized)",
+                kind,
+                kind,
+                sanitize_log(key),
+            )
             return
         try:
             line = json.dumps(record, ensure_ascii=False, default=str)
         except (TypeError, ValueError) as exc:
             logger.warning(
-                "RunInstrumenter: failed to serialize %s record %s=%s: %s", kind, kind, sanitize_log(key), exc
+                "JSONLInstrumenterBackend: failed to serialize %s record %s=%s: %s",
+                kind,
+                kind,
+                sanitize_log(key),
+                exc,
             )
             return
-        write_paths = [path]
-        if self._extra_dirs_ready:
-            write_paths.extend(extra_dir / path.name for extra_dir in self._extra_dirs_ready)
-        for target_path in write_paths:
-            try:
-                with self._lock, target_path.open("a", encoding="utf-8") as fh:
-                    fh.write(line + "\n")
-                logger.debug(
-                    "RunInstrumenter: wrote %s record %s=%s to %s", kind, kind, sanitize_log(key), target_path
-                )
-            except OSError as exc:
-                logger.warning(
-                    "RunInstrumenter: failed to write %s record %s=%s to %s: %s",
-                    kind,
-                    kind,
-                    sanitize_log(key),
-                    target_path,
-                    exc,
-                )
+        with self._lock:
+            for target in targets:
+                try:
+                    with target.open("a", encoding="utf-8") as fh:
+                        fh.write(line + "\n")
+                    logger.debug(
+                        "JSONLInstrumenterBackend: wrote %s record %s=%s to %s",
+                        kind,
+                        kind,
+                        sanitize_log(key),
+                        target,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "JSONLInstrumenterBackend: failed to write %s record %s=%s to %s: %s",
+                        kind,
+                        kind,
+                        sanitize_log(key),
+                        target,
+                        exc,
+                    )
+
+    # -- InstrumenterBackend interface -----------------------------------
+
+    def log_llm_call(
+        self,
+        *,
+        call_id: str,
+        ts_start: str,
+        ts_end: str,
+        wall_ms: float | None,
+        model: str,
+        endpoint: str | None,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        total_tokens: int | None,
+        status: str,
+        error: str | None,
+        ts_ttft: str | None = None,
+        tokens_per_sec: float | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "call_id": call_id,
+            "ts_start": ts_start,
+            "ts_end": ts_end,
+            "wall_ms": wall_ms,
+            "model": model,
+            "endpoint": endpoint,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "status": status,
+            "error": error,
+        }
+        if ts_ttft is not None:
+            record["ts_ttft"] = ts_ttft
+        if tokens_per_sec is not None:
+            record["tokens_per_sec"] = tokens_per_sec
+        self._append_line(self._llm_calls_path(), record, kind="llm_call", key=call_id)
+
+    def log_tool_call(
+        self,
+        *,
+        call_id: str,
+        ts_start: str,
+        ts_end: str,
+        wall_ms: float | None,
+        tool: str,
+        args: dict[str, Any],
+        result: str | None,
+        success: bool,
+        error: str | None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "call_id": call_id,
+            "ts_start": ts_start,
+            "ts_end": ts_end,
+            "wall_ms": wall_ms,
+            "tool": tool,
+            "args": args,
+            "success": success,
+            "error": error,
+        }
+        if result is not None:
+            record["result"] = result
+        self._append_line(self._tool_calls_path(), record, kind="tool_call", key=call_id)
+
+    def log_message(
+        self,
+        *,
+        idx: int,
+        role: str,
+        content: str | None,
+        content_length: int,
+        ts: str,
+        tool_calls: list[str] | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "idx": idx,
+            "role": role,
+            "content_length": content_length,
+            "ts": ts,
+        }
+        if content is not None:
+            record["content"] = content
+        if tool_calls:
+            record["tool_calls"] = list(tool_calls)
+        self._append_line(self._conversation_path(), record, kind="message", key=str(idx))
+
+    def close(self) -> None:
+        # Nothing to flush - every write is already a synchronous, closed
+        # file handle (opened/closed per append in _append_line).
+        logger.debug(
+            "JSONLInstrumenterBackend: close() run_id=%s task_id=%s agent_id=%s (no-op, files already flushed)",
+            sanitize_log(self.run_id),
+            sanitize_log(self.task_id),
+            sanitize_log(self.agent_id),
+        )
+
+
+# SQLite schema for a single agent's run.db - see
+# work/bernstein/sqlite-run-storage-design.md for the full multi-table
+# design; this module implements the subset the instrumentation layer
+# itself owns (llm_calls/tool_calls/messages/run_meta), matching the task
+# spec's schema exactly.
+_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS llm_calls (
+    call_id TEXT PRIMARY KEY,
+    task_id TEXT,
+    agent_id TEXT,
+    ts_start TEXT,
+    ts_end TEXT,
+    wall_ms REAL,
+    model TEXT,
+    endpoint TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    total_tokens INTEGER,
+    status TEXT,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tool_calls (
+    call_id TEXT PRIMARY KEY,
+    task_id TEXT,
+    agent_id TEXT,
+    ts_start TEXT,
+    ts_end TEXT,
+    wall_ms REAL,
+    tool TEXT,
+    args TEXT,
+    result TEXT,
+    success INTEGER,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idx INTEGER,
+    task_id TEXT,
+    agent_id TEXT,
+    role TEXT,
+    content TEXT,
+    content_length INTEGER,
+    ts TEXT
+);
+
+CREATE TABLE IF NOT EXISTS run_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_calls_task   ON llm_calls(task_id);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_agent  ON llm_calls(agent_id);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_ts     ON llm_calls(ts_start);
+
+CREATE INDEX IF NOT EXISTS idx_tool_calls_task  ON tool_calls(task_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_agent ON tool_calls(agent_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_ts    ON tool_calls(ts_start);
+
+CREATE INDEX IF NOT EXISTS idx_messages_task    ON messages(task_id);
+CREATE INDEX IF NOT EXISTS idx_messages_agent   ON messages(agent_id);
+CREATE INDEX IF NOT EXISTS idx_messages_ts      ON messages(ts);
+"""
+
+
+class SQLiteInstrumenterBackend(InstrumenterBackend):
+    """Writes instrumentation records into a single-file SQLite ``run.db``.
+
+    One connection per target directory (``base_dir`` plus any
+    ``extra_dirs`` for batched tasks - see module docstring), opened once at
+    construction time and reused for every write; the instrumenter is
+    already single-threaded per agent process (module docstring), so no
+    connection pool or writer-thread/queue is needed here - a single
+    ``threading.Lock`` still guards against two threads in the SAME process
+    racing on the SAME connection (mirroring the JSONL backend's lock).
+
+    Every write is wrapped in its own try/except: instrumentation must NEVER
+    crash the calling agent, so a SQLite error (disk full, locked file,
+    corrupt db) is logged with a full traceback and swallowed, exactly like
+    the JSONL backend's OSError handling.
+
+    DB location: ``<dir>/run.db`` for each target directory (the same
+    ``base_dir``/``extra_dirs`` the caller already resolves via
+    :func:`resolve_agent_dir` - today that is the per-agent directory, not
+    the run root; see the class-level note in :func:`init_instrumenter` for
+    why this stays consistent with the JSONL backend's existing directory
+    convention instead of introducing a new one-db-per-run path resolution.)
+    """
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        agent_id: str,
+        base_dir: Path,
+        extra_dirs: list[Path] | None = None,
+    ) -> None:
+        self.run_id = run_id
+        self.task_id = task_id
+        self.agent_id = agent_id
+        self.base_dir = Path(base_dir)
+        self.extra_dirs = [Path(d) for d in (extra_dirs or [])]
+        self._lock = threading.Lock()
+        self._connections: dict[Path, sqlite3.Connection] = {}
+
+        all_dirs = [self.base_dir, *[d for d in self.extra_dirs if d != self.base_dir]]
+        logger.debug(
+            "SQLiteInstrumenterBackend: initializing run_id=%s task_id=%s agent_id=%s dirs=%s",
+            sanitize_log(self.run_id),
+            sanitize_log(self.task_id),
+            sanitize_log(self.agent_id),
+            all_dirs,
+        )
+        for target_dir in all_dirs:
+            self._open_db(target_dir)
+
+    def _open_db(self, target_dir: Path) -> None:
+        db_path = target_dir / "run.db"
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.executescript(_SQLITE_SCHEMA)
+            conn.commit()
+            self._connections[target_dir] = conn
+            logger.info(
+                "SQLiteInstrumenterBackend: opened %s run_id=%s task_id=%s agent_id=%s (WAL mode, "
+                "schema created/verified)",
+                db_path,
+                sanitize_log(self.run_id),
+                sanitize_log(self.task_id),
+                sanitize_log(self.agent_id),
+            )
+        except sqlite3.Error:
+            logger.warning(
+                "SQLiteInstrumenterBackend: failed to open/create %s (run_id=%s task_id=%s agent_id=%s) - "
+                "instrumentation for this dir is DISABLED, the agent run itself is unaffected",
+                db_path,
+                sanitize_log(self.run_id),
+                sanitize_log(self.task_id),
+                sanitize_log(self.agent_id),
+                exc_info=True,
+            )
+        except OSError:
+            logger.warning(
+                "SQLiteInstrumenterBackend: failed to create dir %s (run_id=%s task_id=%s agent_id=%s) - "
+                "instrumentation for this dir is DISABLED, the agent run itself is unaffected",
+                target_dir,
+                sanitize_log(self.run_id),
+                sanitize_log(self.task_id),
+                sanitize_log(self.agent_id),
+                exc_info=True,
+            )
+
+    def _execute_all(self, table: str, sql: str, params: tuple[Any, ...], *, key: str) -> None:
+        if not self._connections:
+            logger.debug(
+                "SQLiteInstrumenterBackend: dropping %s write key=%s - no ready run.db connection "
+                "(open failed or backend uninitialized)",
+                table,
+                sanitize_log(key),
+            )
+            return
+        with self._lock:
+            for target_dir, conn in self._connections.items():
+                try:
+                    conn.execute(sql, params)
+                    conn.commit()
+                    logger.debug(
+                        "SQLiteInstrumenterBackend: wrote 1 row to %s (key=%s) in %s",
+                        table,
+                        sanitize_log(key),
+                        target_dir / "run.db",
+                    )
+                except sqlite3.Error:
+                    logger.warning(
+                        "SQLiteInstrumenterBackend: failed to write %s row key=%s to %s",
+                        table,
+                        sanitize_log(key),
+                        target_dir / "run.db",
+                        exc_info=True,
+                    )
+
+    # -- InstrumenterBackend interface -----------------------------------
+
+    def log_llm_call(
+        self,
+        *,
+        call_id: str,
+        ts_start: str,
+        ts_end: str,
+        wall_ms: float | None,
+        model: str,
+        endpoint: str | None,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        total_tokens: int | None,
+        status: str,
+        error: str | None,
+        ts_ttft: str | None = None,
+        tokens_per_sec: float | None = None,
+    ) -> None:
+        # ts_ttft/tokens_per_sec have no column in the task-spec'd llm_calls
+        # schema (streaming-only fields) - dropped here with a debug log
+        # rather than silently lost; the JSONL backend still preserves them.
+        if ts_ttft is not None or tokens_per_sec is not None:
+            logger.debug(
+                "SQLiteInstrumenterBackend.log_llm_call: dropping ts_ttft=%s tokens_per_sec=%s for call_id=%s "
+                "(no column in llm_calls schema; JSONL backend preserves these)",
+                ts_ttft,
+                tokens_per_sec,
+                sanitize_log(call_id),
+            )
+        self._execute_all(
+            "llm_calls",
+            "INSERT OR REPLACE INTO llm_calls "
+            "(call_id, task_id, agent_id, ts_start, ts_end, wall_ms, model, endpoint, "
+            "prompt_tokens, completion_tokens, total_tokens, status, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                call_id,
+                self.task_id,
+                self.agent_id,
+                ts_start,
+                ts_end,
+                wall_ms,
+                model,
+                endpoint,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                status,
+                error,
+            ),
+            key=call_id,
+        )
+
+    def log_tool_call(
+        self,
+        *,
+        call_id: str,
+        ts_start: str,
+        ts_end: str,
+        wall_ms: float | None,
+        tool: str,
+        args: dict[str, Any],
+        result: str | None,
+        success: bool,
+        error: str | None,
+    ) -> None:
+        try:
+            args_json = json.dumps(args, ensure_ascii=False, default=str)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "SQLiteInstrumenterBackend.log_tool_call: failed to serialize args for %s: %s",
+                sanitize_log(call_id),
+                exc,
+            )
+            args_json = "{}"
+        self._execute_all(
+            "tool_calls",
+            "INSERT OR REPLACE INTO tool_calls "
+            "(call_id, task_id, agent_id, ts_start, ts_end, wall_ms, tool, args, result, success, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                call_id,
+                self.task_id,
+                self.agent_id,
+                ts_start,
+                ts_end,
+                wall_ms,
+                tool,
+                args_json,
+                result,
+                1 if success else 0,
+                error,
+            ),
+            key=call_id,
+        )
+
+    def log_message(
+        self,
+        *,
+        idx: int,
+        role: str,
+        content: str | None,
+        content_length: int,
+        ts: str,
+        tool_calls: list[str] | None = None,
+    ) -> None:
+        # tool_calls has no column in the task-spec'd messages schema -
+        # dropped here with a debug log; the JSONL backend still preserves it.
+        if tool_calls:
+            logger.debug(
+                "SQLiteInstrumenterBackend.log_message: dropping tool_calls=%s for idx=%s "
+                "(no column in messages schema; JSONL backend preserves these)",
+                tool_calls,
+                idx,
+            )
+        self._execute_all(
+            "messages",
+            "INSERT INTO messages (idx, task_id, agent_id, role, content, content_length, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (idx, self.task_id, self.agent_id, role, content, content_length, ts),
+            key=str(idx),
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            for target_dir, conn in self._connections.items():
+                try:
+                    conn.commit()
+                    conn.close()
+                    logger.debug("SQLiteInstrumenterBackend: closed %s", target_dir / "run.db")
+                except sqlite3.Error:
+                    logger.warning("SQLiteInstrumenterBackend: error closing %s", target_dir / "run.db", exc_info=True)
+            self._connections.clear()
+
+
+def _make_backend(
+    backend: str,
+    *,
+    run_id: str,
+    task_id: str,
+    agent_id: str,
+    base_dir: Path,
+    extra_dirs: list[Path] | None,
+) -> InstrumenterBackend:
+    """Construct the requested backend, logging the selection decision."""
+    if backend == "sqlite":
+        logger.debug(
+            "init_instrumenter: using sqlite backend run_id=%s task_id=%s agent_id=%s",
+            sanitize_log(run_id),
+            sanitize_log(task_id),
+            sanitize_log(agent_id),
+        )
+        return SQLiteInstrumenterBackend(
+            run_id=run_id, task_id=task_id, agent_id=agent_id, base_dir=base_dir, extra_dirs=extra_dirs
+        )
+    if backend == "jsonl":
+        logger.debug(
+            "init_instrumenter: using jsonl backend run_id=%s task_id=%s agent_id=%s",
+            sanitize_log(run_id),
+            sanitize_log(task_id),
+            sanitize_log(agent_id),
+        )
+        return JSONLInstrumenterBackend(
+            run_id=run_id, task_id=task_id, agent_id=agent_id, base_dir=base_dir, extra_dirs=extra_dirs
+        )
+    raise ValueError(f"init_instrumenter: unknown backend {backend!r} (expected 'sqlite' or 'jsonl')")
+
+
+# ---------------------------------------------------------------------------
+# Facade
+# ---------------------------------------------------------------------------
+
+
+class RunInstrumenter:
+    """Facade over a pluggable :class:`InstrumenterBackend`.
+
+    One instance is expected per (run_id, task_id, agent_id) triple - i.e.
+    per agent process/session. Public method signatures are unchanged from
+    the pre-refactor, JSONL-only implementation so every existing call site
+    (:mod:`bernstein.adapters.openai_agents_runner`) keeps working without
+    modification.
+
+    Every public method is defensive: a failure anywhere in the backend is
+    logged at WARNING and swallowed, never raised, so a full disk /
+    permissions problem / serialization bug can never take down the agent
+    run being observed.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        agent_id: str,
+        base_dir: Path,
+        extra_dirs: list[Path] | None = None,
+        backend: str = _DEFAULT_BACKEND,
+    ) -> None:
+        self.run_id = run_id
+        self.task_id = task_id
+        self.agent_id = agent_id
+        self.base_dir = Path(base_dir)
+        self.extra_dirs = [Path(d) for d in (extra_dirs or [])]
+        self.backend_name = backend
+        self._backend: InstrumenterBackend | None = _make_backend(
+            backend,
+            run_id=run_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            base_dir=base_dir,
+            extra_dirs=extra_dirs,
+        )
 
     # -- public API -------------------------------------------------------
 
@@ -305,7 +983,7 @@ class RunInstrumenter:
         status: str = "ok",
         error: str | None = None,
     ) -> None:
-        """Append one record to ``llm-calls.jsonl`` for a single LLM API call.
+        """Record one LLM API call.
 
         ``wall_ms`` is computed from ``ts_start``/``ts_end`` when not given
         explicitly. ``tokens_per_sec`` is only ever computed by the CALLER
@@ -318,24 +996,26 @@ class RunInstrumenter:
                 wall_ms = _iso_delta_ms(ts_start, ts_end)
             if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
                 total_tokens = prompt_tokens + completion_tokens
-            record: dict[str, Any] = {
-                "call_id": call_id,
-                "ts_start": ts_start,
-                "ts_end": ts_end,
-                "wall_ms": wall_ms,
-                "model": model,
-                "endpoint": endpoint,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens,
-                "status": status,
-                "error": error,
-            }
-            if ts_ttft is not None:
-                record["ts_ttft"] = ts_ttft
-            if tokens_per_sec is not None:
-                record["tokens_per_sec"] = tokens_per_sec
-            self._append_line(self._llm_calls_path(), record, kind="llm_call", key=call_id)
+            if self._backend is None:
+                logger.debug(
+                    "RunInstrumenter.log_llm_call: no backend ready, dropping call_id=%s", sanitize_log(call_id)
+                )
+                return
+            self._backend.log_llm_call(
+                call_id=call_id,
+                ts_start=ts_start,
+                ts_end=ts_end,
+                wall_ms=wall_ms,
+                model=model,
+                endpoint=endpoint,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                status=status,
+                error=error,
+                ts_ttft=ts_ttft,
+                tokens_per_sec=tokens_per_sec,
+            )
         except Exception as exc:  # intentional-broad-except: instrumentation must never raise
             logger.warning("RunInstrumenter.log_llm_call failed for call_id=%s: %s", sanitize_log(call_id), exc)
 
@@ -352,7 +1032,7 @@ class RunInstrumenter:
         wall_ms: float | None = None,
         result: Any = None,
     ) -> None:
-        """Append one record to ``tool-calls.jsonl`` for a single tool invocation.
+        """Record one tool invocation.
 
         ``args`` is truncated (see :func:`_truncate_value`) before being
         written - never the full tool call arguments unbounded, only a
@@ -361,28 +1041,41 @@ class RunInstrumenter:
         ``result`` (bug fix, 2026-07-04: see :data:`_TOOL_RESULT_TRUNCATE_CHARS`)
         is the tool's own return value - whatever the caller's tool
         implementation produced (a string, dict, etc.) - stringified and
-        truncated to :data:`_TOOL_RESULT_TRUNCATE_CHARS` characters before
-        being written under the ``result`` key. ``None`` (the default) omits
-        the key entirely, matching every call site that has no result to
-        report (e.g. a failed call where the error already carries the
-        relevant text).
+        truncated to :data:`_TOOL_RESULT_TRUNCATE_CHARS` characters via
+        :func:`_truncate_text` before being written under the ``result``
+        key. ``None`` (the default) omits the key entirely, matching every
+        call site that has no result to report (e.g. a failed call where
+        the error already carries the relevant text).
         """
         try:
             if wall_ms is None:
                 wall_ms = _iso_delta_ms(ts_start, ts_end)
-            record: dict[str, Any] = {
-                "call_id": call_id,
-                "ts_start": ts_start,
-                "ts_end": ts_end,
-                "wall_ms": wall_ms,
-                "tool": tool,
-                "args": _truncate_value(args or {}),
-                "success": success,
-                "error": error,
-            }
-            if result is not None:
-                record["result"] = _truncate_value(result, max_chars=_TOOL_RESULT_TRUNCATE_CHARS)
-            self._append_line(self._tool_calls_path(), record, kind="tool_call", key=call_id)
+            truncated_args = _truncate_value(args or {})
+            truncated_result = _truncate_text(
+                result, max_chars=_TOOL_RESULT_TRUNCATE_CHARS, field_name="tool_call.result", key=call_id
+            )
+            if truncated_result is None:
+                logger.debug(
+                    "RunInstrumenter.log_tool_call: no result value provided for call_id=%s tool=%s",
+                    sanitize_log(call_id),
+                    tool,
+                )
+            if self._backend is None:
+                logger.debug(
+                    "RunInstrumenter.log_tool_call: no backend ready, dropping call_id=%s", sanitize_log(call_id)
+                )
+                return
+            self._backend.log_tool_call(
+                call_id=call_id,
+                ts_start=ts_start,
+                ts_end=ts_end,
+                wall_ms=wall_ms,
+                tool=tool,
+                args=truncated_args,
+                result=truncated_result,
+                success=success,
+                error=error,
+            )
         except Exception as exc:  # intentional-broad-except: instrumentation must never raise
             logger.warning("RunInstrumenter.log_tool_call failed for call_id=%s: %s", sanitize_log(call_id), exc)
 
@@ -394,47 +1087,51 @@ class RunInstrumenter:
         content_length: int,
         tool_calls: list[str] | None = None,
         ts: str | None = None,
-        content: str | None = None,
+        content: Any = None,
     ) -> None:
-        """Append one record to ``conversation.jsonl`` for a new message.
+        """Record one new conversation message.
 
         Shape metadata (``role``/``content_length``/``tool_calls``) is
         always recorded. ``content`` (bug fix, 2026-07-04: see
         :data:`_MESSAGE_CONTENT_TRUNCATE_CHARS`) is optional actual message
-        text, truncated to :data:`_MESSAGE_CONTENT_TRUNCATE_CHARS` characters
-        before being written under the ``content`` key - callers that only
-        have shape metadata (or that intentionally withhold content for
-        privacy/size reasons) pass ``None`` (the default) and the key is
-        omitted entirely, preserving the original shape-only behavior.
+        text - stringified via :func:`_truncate_text` and truncated to
+        :data:`_MESSAGE_CONTENT_TRUNCATE_CHARS` characters before being
+        written under the ``content`` key. Callers that only have shape
+        metadata (or that intentionally withhold content for privacy/size
+        reasons) pass ``None`` (the default) and the key is omitted
+        entirely, preserving the original shape-only behavior.
         """
         try:
-            record: dict[str, Any] = {
-                "idx": idx,
-                "role": role,
-                "content_length": content_length,
-                "ts": ts or _now_iso(),
-            }
-            if tool_calls:
-                record["tool_calls"] = list(tool_calls)
-            if content is not None:
-                record["content"] = _truncate_value(content, max_chars=_MESSAGE_CONTENT_TRUNCATE_CHARS)
-            self._append_line(self._conversation_path(), record, kind="message", key=str(idx))
+            resolved_ts = ts or _now_iso()
+            truncated_content = _truncate_text(
+                content, max_chars=_MESSAGE_CONTENT_TRUNCATE_CHARS, field_name="message.content", key=str(idx)
+            )
+            if truncated_content is None:
+                logger.debug("RunInstrumenter.log_message: no content value provided for idx=%s role=%s", idx, role)
+            if self._backend is None:
+                logger.debug("RunInstrumenter.log_message: no backend ready, dropping idx=%s", idx)
+                return
+            self._backend.log_message(
+                idx=idx,
+                role=role,
+                content=truncated_content,
+                content_length=content_length,
+                ts=resolved_ts,
+                tool_calls=tool_calls,
+            )
         except Exception as exc:  # intentional-broad-except: instrumentation must never raise
             logger.warning("RunInstrumenter.log_message failed for idx=%s: %s", idx, exc)
 
-
-def _iso_delta_ms(ts_start: str, ts_end: str) -> float | None:
-    """Best-effort millisecond delta between two ISO-8601 timestamps.
-
-    Returns ``None`` (never raises, never fabricates a value) when either
-    timestamp fails to parse.
-    """
-    try:
-        start = datetime.fromisoformat(ts_start)
-        end = datetime.fromisoformat(ts_end)
-        return (end - start).total_seconds() * 1000.0
-    except (ValueError, TypeError):
-        return None
+    def close(self) -> None:
+        """Flush/cleanup the active backend. Safe to call multiple times."""
+        if self._backend is None:
+            return
+        try:
+            self._backend.close()
+        except Exception as exc:
+            logger.warning("RunInstrumenter.close failed: %s", exc)
+        finally:
+            self._backend = None
 
 
 class _NullInstrumenter(RunInstrumenter):
@@ -442,29 +1139,38 @@ class _NullInstrumenter(RunInstrumenter):
 
     Lets call sites do ``get_instrumenter().log_llm_call(...)`` unconditionally
     without an ``if instrumenter is not None`` guard at every call site, while
-    guaranteeing zero disk I/O (and zero directory creation) until a real
+    guaranteeing zero disk I/O (and zero directory/DB creation) until a real
     instrumenter is explicitly initialized via :func:`init_instrumenter`.
     """
 
-    def __init__(self) -> None:  # intentionally skips __post_init__ dir creation
+    def __init__(self) -> None:  # intentionally skips backend creation, no base __init__ to call
         self.run_id = "uninitialized"
         self.task_id = "uninitialized"
         self.agent_id = "uninitialized"
         self.base_dir = Path()
-        self._lock = threading.Lock()
-        self._dir_ready = False
+        self.extra_dirs = []
+        self.backend_name = "none"
+        self._backend = None
 
 
 _instrumenter_lock = threading.Lock()
 _instrumenter: RunInstrumenter | None = None
 _null_instrumenter = _NullInstrumenter()
 
+# Count of get_instrumenter() calls that returned the NullInstrumenter
+# fallback, for debug visibility into "did init_instrumenter ever run in
+# this process" (see log line in get_instrumenter below). Not thread-safe
+# (best-effort counter, not a correctness-critical value).
+_null_fallback_count = 0
+
 
 def resolve_agent_dir(workdir: Path, run_id: str, task_id: str, agent_id: str) -> Path:
     """Return the per-agent instrumentation directory for the given ids.
 
     Mirrors the wave-2 run layout (``.sdd/runs/<run_id>/...``) documented in
-    :mod:`bernstein.core.orchestration.run_report`.
+    :mod:`bernstein.core.orchestration.run_report`. Used as ``base_dir`` by
+    both backends - the JSONL backend writes its three ``*.jsonl`` files
+    directly here; the SQLite backend writes a single ``run.db`` here.
 
     Each id is sanitized to a single directory-name component first (see
     :func:`_sanitize_path_component`): ``run_id`` comes from the
@@ -492,35 +1198,58 @@ def init_instrumenter(
     agent_id: str,
     base_dir: Path,
     extra_dirs: list[Path] | None = None,
+    backend: str = _DEFAULT_BACKEND,
 ) -> RunInstrumenter:
     """Create and install the process-wide :class:`RunInstrumenter` singleton.
 
     Safe to call more than once (e.g. a test re-initializing between cases);
-    each call replaces the previous singleton. Never raises - construction
-    failures are caught inside :meth:`RunInstrumenter.__post_init__` and
-    degrade to a disabled-but-non-crashing instance.
+    each call replaces the previous singleton (the previous backend is
+    closed first so file handles/DB connections don't leak across
+    re-initializations). Never raises - construction failures are caught
+    inside the backend's own constructor and degrade to a disabled-but-
+    non-crashing instance.
 
-    ``extra_dirs``: additional per-agent instrumentation directories (one per
-    OTHER task in a batch this agent process is working) that every JSONL
-    write should be fanned out to, in addition to ``base_dir``. See
-    :class:`RunInstrumenter`'s ``extra_dirs`` docstring and the call site in
-    :func:`bernstein.adapters.openai_agents_runner.run` (batch instrumentation
-    fan-out, instrumentation audit bug 3). Defaults to none.
+    ``backend`` selects the storage sink: ``"sqlite"`` (default) writes a
+    single ``run.db`` per target dir; ``"jsonl"`` writes the original
+    three-file-per-agent format. See
+    ``work/bernstein/sqlite-run-storage-design.md`` for the full design.
+
+    ``extra_dirs`` (bug 3 fix - see :class:`JSONLInstrumenterBackend`
+    docstring on ``extra_dirs``): when the spawner batches multiple tasks
+    onto one agent process, pass the OTHER tasks' agent dirs here so every
+    task in the batch gets a full copy of this agent's instrumentation
+    instead of only ``task_id``'s. Works identically for both backends -
+    the SQLite backend opens one ``run.db`` connection per target dir,
+    mirroring the JSONL backend's one-file-set per target dir.
     """
     global _instrumenter
     resolved_extra_dirs = list(extra_dirs or [])
     logger.info(
-        "init_instrumenter: run_id=%s task_id=%s agent_id=%s base_dir=%s extra_dirs=%s "
+        "init_instrumenter called: run_id=%s task_id=%s agent_id=%s base_dir=%s extra_dirs=%s backend=%s "
         "(%d extra dir(s) requested for batch fan-out)",
         sanitize_log(run_id),
         sanitize_log(task_id),
         sanitize_log(agent_id),
         base_dir,
         resolved_extra_dirs,
+        backend,
         len(resolved_extra_dirs),
     )
+    with _instrumenter_lock:
+        previous = _instrumenter
+    if previous is not None:
+        try:
+            previous.close()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("init_instrumenter: error closing previous instrumenter: %s", exc)
+
     instrumenter = RunInstrumenter(
-        run_id=run_id, task_id=task_id, agent_id=agent_id, base_dir=base_dir, extra_dirs=resolved_extra_dirs
+        run_id=run_id,
+        task_id=task_id,
+        agent_id=agent_id,
+        base_dir=base_dir,
+        extra_dirs=resolved_extra_dirs,
+        backend=backend,
     )
     with _instrumenter_lock:
         _instrumenter = instrumenter
@@ -534,6 +1263,116 @@ def get_instrumenter() -> RunInstrumenter:
     an un-instrumented context (e.g. a unit test that imports a hooked
     module without calling :func:`init_instrumenter`) degrades to "nothing
     is written" instead of an ``AttributeError``.
+
+    Logs at DEBUG the first few times this falls back to the
+    :class:`_NullInstrumenter` in a process where a hook fired before
+    :func:`init_instrumenter` ran (or it never ran at all) - a silent
+    NullInstrumenter fallback is exactly the failure mode behind bug 3
+    ("zero instrumentation" for some tasks), so every fallback is now
+    visible in the logs rather than swallowed.
     """
+    global _null_fallback_count
     with _instrumenter_lock:
-        return _instrumenter if _instrumenter is not None else _null_instrumenter
+        if _instrumenter is not None:
+            return _instrumenter
+        _null_fallback_count += 1
+        if _null_fallback_count <= 10 or _null_fallback_count % 100 == 0:
+            logger.debug(
+                "get_instrumenter: returning NullInstrumenter fallback (call #%d in this process) - "
+                "init_instrumenter has not been called yet, or was never called; any hook firing "
+                "right now writes NOTHING to disk",
+                _null_fallback_count,
+            )
+        return _null_instrumenter
+
+
+def update_global_index(runs_dir: Path, run_id: str, meta_dict: dict[str, Any]) -> None:
+    """Upsert one run-summary row into the shared ``<runs_dir>/index.db``.
+
+    Called after a run completes (or periodically) so cross-run queries
+    (``bernstein runs list``, ``runs compare``) never need to glob and open
+    every per-run ``run.db`` - see
+    ``work/bernstein/sqlite-run-storage-design.md`` §2. ``index.db`` is a
+    derived cache: every column here is recomputable from the per-run
+    ``run.db`` files, so a failure to write here is logged and swallowed,
+    never raised - it must not affect the calling run's own completion.
+
+    ``meta_dict`` keys map directly onto the ``runs`` table columns:
+    ``dir_name``, ``issue``, ``repo``, ``workflow``, ``model``, ``git_sha``,
+    ``started_at``, ``finished_at``, ``total_duration_s``, ``status``,
+    ``task_count``, ``agent_count``. Missing keys are stored as ``NULL``.
+    """
+    db_path = Path(runs_dir) / "index.db"
+    logger.debug("update_global_index: upserting run_id=%s into %s meta=%s", sanitize_log(run_id), db_path, meta_dict)
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS runs (
+                    run_id TEXT PRIMARY KEY,
+                    dir_name TEXT,
+                    issue TEXT,
+                    repo TEXT,
+                    workflow TEXT,
+                    model TEXT,
+                    git_sha TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    total_duration_s REAL,
+                    status TEXT,
+                    task_count INTEGER,
+                    agent_count INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_runs_issue   ON runs(issue);
+                CREATE INDEX IF NOT EXISTS idx_runs_status  ON runs(status);
+                CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO runs (
+                    run_id, dir_name, issue, repo, workflow, model, git_sha,
+                    started_at, finished_at, total_duration_s, status, task_count, agent_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    dir_name=excluded.dir_name,
+                    issue=excluded.issue,
+                    repo=excluded.repo,
+                    workflow=excluded.workflow,
+                    model=excluded.model,
+                    git_sha=excluded.git_sha,
+                    started_at=excluded.started_at,
+                    finished_at=excluded.finished_at,
+                    total_duration_s=excluded.total_duration_s,
+                    status=excluded.status,
+                    task_count=excluded.task_count,
+                    agent_count=excluded.agent_count
+                """,
+                (
+                    run_id,
+                    meta_dict.get("dir_name"),
+                    meta_dict.get("issue"),
+                    meta_dict.get("repo"),
+                    meta_dict.get("workflow"),
+                    meta_dict.get("model"),
+                    meta_dict.get("git_sha"),
+                    meta_dict.get("started_at"),
+                    meta_dict.get("finished_at"),
+                    meta_dict.get("total_duration_s"),
+                    meta_dict.get("status"),
+                    meta_dict.get("task_count"),
+                    meta_dict.get("agent_count"),
+                ),
+            )
+            conn.commit()
+            logger.info("update_global_index: upserted run_id=%s into %s", sanitize_log(run_id), db_path)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.warning("update_global_index: failed to upsert run_id=%s into %s", sanitize_log(run_id), db_path, exc_info=True)
+    except OSError:
+        logger.warning("update_global_index: failed to create parent dir for %s", db_path, exc_info=True)
