@@ -633,14 +633,14 @@ def _parse_bridge_settings(raw: object) -> BridgeConfigSet | None:
     return BridgeConfigSet(openclaw=_parse_openclaw_runtime_config(data.get("openclaw")))
 
 
-def _parse_role_model_policy(raw: object) -> dict[str, dict[str, str | int]] | None:
+def _parse_role_model_policy(raw: object) -> dict[str, dict[str, str | int | dict[str, object]]] | None:
     """Parse optional role-specific provider/model overrides."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise SeedError("role_model_policy must be a mapping of role -> settings")
 
-    parsed: dict[str, dict[str, str | int]] = {}
+    parsed: dict[str, dict[str, str | int | dict[str, object]]] = {}
     for role, settings in raw.items():
         if not isinstance(role, str) or not role:
             raise SeedError("role_model_policy keys must be non-empty role strings")
@@ -666,8 +666,105 @@ _ROLE_POLICY_KEYS: tuple[str, ...] = (
 # "unknown keys: max_tokens" (parser/schema divergence fixed here).
 _ROLE_POLICY_INT_KEYS: tuple[str, ...] = ("max_tokens",)
 
+# ``council`` is parsed and validated separately (its value is a nested
+# mapping, not a scalar string/int like every other role-policy key), so it
+# is carved out of the unknown-keys check in ``_parse_single_role_policy``
+# rather than added to ``_ROLE_POLICY_KEYS``.
+_ROLE_POLICY_COUNCIL_KEY = "council"
 
-def _parse_single_role_policy(role: str, settings: object) -> dict[str, str | int]:
+_COUNCIL_CANDIDATE_KEYS: tuple[str, ...] = ("model", "base_url", "api_key_env")
+
+
+def _parse_council_candidate(role: str, member: str, raw: object) -> dict[str, str]:
+    """Parse one ``candidates[]`` entry or the ``judge`` entry of a council block.
+
+    ``member`` is a human-readable label (``"candidates[0]"`` or
+    ``"judge"``) used only for error messages. ``model`` is required;
+    ``base_url``/``api_key_env`` are optional and follow the same
+    fail-closed ``api_key_env`` credential-allowlist validation as the
+    top-level role policy fields of the same name.
+    """
+    if not isinstance(raw, dict):
+        raise SeedError(f"role_model_policy[{role!r}].council.{member} must be a mapping")
+
+    model = raw.get("model")
+    if not isinstance(model, str) or not model:
+        raise SeedError(f"role_model_policy[{role!r}].council.{member}.model must be a non-empty string")
+    parsed: dict[str, str] = {"model": model}
+
+    for key in ("base_url", "api_key_env"):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value:
+            raise SeedError(f"role_model_policy[{role!r}].council.{member}.{key} must be a non-empty string")
+        parsed[key] = value
+
+    if "api_key_env" in parsed:
+        from bernstein.adapters.openai_agents_runner import validate_api_key_env_name
+
+        try:
+            validate_api_key_env_name(parsed["api_key_env"])
+        except RuntimeError as exc:
+            raise SeedError(f"role_model_policy[{role!r}].council.{member}.api_key_env: {exc}") from exc
+
+    unknown_keys = sorted(set(raw) - set(_COUNCIL_CANDIDATE_KEYS))
+    if unknown_keys:
+        raise SeedError(
+            f"role_model_policy[{role!r}].council.{member} has unknown keys: {', '.join(unknown_keys)}"
+        )
+    return parsed
+
+
+def _parse_council(role: str, raw: object) -> dict[str, object]:
+    """Parse the optional ``council:`` block of a role's model policy.
+
+    Shape (mirrors :class:`bernstein.core.config.config_schema.CouncilConfig`)::
+
+        council:
+          candidates:
+            - model: gpt-5-mini
+            - model: deepseek/deepseek-v4-flash
+              base_url: https://openrouter.ai/api/v1
+              api_key_env: OPENROUTER_API_KEY
+          judge:
+            model: gpt-5
+          timeout: 60.0
+
+    ``candidates`` must be a non-empty list; ``judge`` is required.
+    ``timeout`` is optional and defaults to 60.0 seconds (matching
+    ``CouncilConfig.timeout``'s Pydantic default) when absent.
+    """
+    if not isinstance(raw, dict):
+        raise SeedError(f"role_model_policy[{role!r}].council must be a mapping")
+
+    raw_candidates = raw.get("candidates")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        raise SeedError(f"role_model_policy[{role!r}].council.candidates must be a non-empty list")
+    candidates = [
+        _parse_council_candidate(role, f"candidates[{i}]", entry) for i, entry in enumerate(raw_candidates)
+    ]
+
+    raw_judge = raw.get("judge")
+    if raw_judge is None:
+        raise SeedError(f"role_model_policy[{role!r}].council.judge is required")
+    judge = _parse_council_candidate(role, "judge", raw_judge)
+
+    parsed: dict[str, object] = {"candidates": candidates, "judge": judge}
+
+    raw_timeout = raw.get("timeout")
+    if raw_timeout is not None:
+        if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)) or raw_timeout <= 0:
+            raise SeedError(f"role_model_policy[{role!r}].council.timeout must be a positive number")
+        parsed["timeout"] = float(raw_timeout)
+
+    unknown_keys = sorted(set(raw) - {"candidates", "judge", "timeout"})
+    if unknown_keys:
+        raise SeedError(f"role_model_policy[{role!r}].council has unknown keys: {', '.join(unknown_keys)}")
+    return parsed
+
+
+def _parse_single_role_policy(role: str, settings: object) -> dict[str, str | int | dict[str, object]]:
     """Parse and validate a single role's model policy settings.
 
     ``base_url`` and ``api_key_env`` are optional per-role endpoint
@@ -682,11 +779,30 @@ def _parse_single_role_policy(role: str, settings: object) -> dict[str, str | in
     (see :data:`_ROLE_POLICY_INT_KEYS`); it is validated as a positive int
     here and flows unchanged into
     :meth:`bernstein.core.agents.spawner_core.AgentSpawner._apply_sampling_overrides`.
+
+    ``council`` is an optional "council of agents" fan-out/judge block (see
+    :func:`_parse_council` and
+    :class:`bernstein.core.config.config_schema.CouncilConfig`). When
+    present, it is parsed into a nested dict and carried under the
+    ``"council"`` key alongside the scalar fields above - the adapter/spawn
+    path is responsible for using it to drive a TASK-LEVEL council run
+    (``bernstein.adapters.council_runner.run_council``) instead of a single
+    model for this role.
+
+    A separate, simpler convention also produces a council run: setting
+    ``model`` itself to a ``.yaml``/``.yml`` path (e.g.
+    ``"councils/planning.yaml"``) instead of a real model id. That path is
+    stored here completely unresolved/unvalidated - deliberately, so a seed
+    file with a council-file reference for a role parses successfully even
+    when the file's contents are only meaningful at run time, in the
+    worktree, relative to ``.bernstein/``. The runner
+    (``openai_agents_runner._load_council_config``) is what actually
+    resolves and loads it, at spawn/run time, not here.
     """
     if not isinstance(settings, dict):
         raise SeedError(f"role_model_policy[{role!r}] must be a mapping")
 
-    normalized: dict[str, str | int] = {}
+    normalized: dict[str, str | int | dict[str, object]] = {}
     for key in _ROLE_POLICY_KEYS:
         value = settings.get(key)
         if value is None:
@@ -718,7 +834,11 @@ def _parse_single_role_policy(role: str, settings: object) -> dict[str, str | in
     if "cli" in normalized and "provider" not in normalized:
         normalized["provider"] = normalized["cli"]
 
-    allowed_keys = set(_ROLE_POLICY_KEYS) | set(_ROLE_POLICY_INT_KEYS)
+    raw_council = settings.get(_ROLE_POLICY_COUNCIL_KEY)
+    if raw_council is not None:
+        normalized[_ROLE_POLICY_COUNCIL_KEY] = _parse_council(role, raw_council)
+
+    allowed_keys = set(_ROLE_POLICY_KEYS) | set(_ROLE_POLICY_INT_KEYS) | {_ROLE_POLICY_COUNCIL_KEY}
     unknown_keys = sorted(set(settings) - allowed_keys)
     if unknown_keys:
         raise SeedError(f"role_model_policy[{role!r}] has unknown keys: {', '.join(unknown_keys)}")
