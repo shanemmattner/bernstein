@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import json
 import logging
 import re
@@ -3066,16 +3067,52 @@ class AgentSpawner:
                             _budget_mult = max(float(t.metadata.get("budget_multiplier", 1.0)) for t in tasks)
                             # Cacheable prefix extraction is deferred to adapters
                             # that support provider-specific caching.
-                            result = target_adapter.spawn(
-                                prompt=prompt,
-                                workdir=spawn_cwd,
-                                model_config=model_config,
-                                session_id=session_id,
-                                mcp_config=attempt_mcp,
-                                task_scope=max_scope,
-                                budget_multiplier=_budget_mult,
-                                system_addendum="",
-                            )
+                            spawn_kwargs: dict[str, Any] = {
+                                "prompt": prompt,
+                                "workdir": spawn_cwd,
+                                "model_config": model_config,
+                                "session_id": session_id,
+                                "mcp_config": attempt_mcp,
+                                "task_scope": max_scope,
+                                "budget_multiplier": _budget_mult,
+                                "system_addendum": "",
+                            }
+                            # max_turns override (see server_models.TaskCreate.max_turns
+                            # and claude_max_turns.compute_max_turns): read the explicit
+                            # override off the task being spawned and thread it through
+                            # ONLY if the target adapter's spawn() signature actually
+                            # accepts it - not every adapter implements this yet (only
+                            # the Claude adapter as of this wave), and passing an
+                            # unexpected kwarg would crash the spawn call outright.
+                            _explicit_max_turns = getattr(tasks[0], "max_turns", None) if tasks else None
+                            if _explicit_max_turns is not None:
+                                try:
+                                    _spawn_params = inspect.signature(target_adapter.spawn).parameters
+                                except (TypeError, ValueError) as exc:
+                                    logger.warning(
+                                        "explicit_max_turns=%s: could not inspect %s.spawn signature (%s) - skipping",
+                                        _explicit_max_turns,
+                                        adapter_name,
+                                        exc,
+                                    )
+                                    _spawn_params = {}
+                                if "explicit_max_turns" in _spawn_params:
+                                    spawn_kwargs["explicit_max_turns"] = _explicit_max_turns
+                                    logger.info(
+                                        "explicit_max_turns=%s threaded through to adapter=%s for task=%s",
+                                        _explicit_max_turns,
+                                        adapter_name,
+                                        tasks[0].id,
+                                    )
+                                else:
+                                    logger.info(
+                                        "explicit_max_turns=%s requested for task=%s but adapter=%s does not "
+                                        "support explicit_max_turns - skipping (falls back to auto-computed turns)",
+                                        _explicit_max_turns,
+                                        tasks[0].id,
+                                        adapter_name,
+                                    )
+                            result = target_adapter.spawn(**spawn_kwargs)
                         spawn_duration = time.perf_counter() - spawn_start
                         agent_spawn_duration.labels(adapter=provider_name or adapter_name).observe(spawn_duration)
                         self._adapter_health.record_success(adapter_name, latency_ms=spawn_duration * 1000)
