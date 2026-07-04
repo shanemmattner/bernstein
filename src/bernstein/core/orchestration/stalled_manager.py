@@ -336,16 +336,27 @@ def _resolve_stall_threshold_s(orch: Any) -> float:
 
     if resolved is None:
         config_value = getattr(getattr(orch, "_config", None), "stalled_manager_threshold_s", None)
-        if config_value is not None and _is_sane_threshold(float(config_value)):
-            resolved = float(config_value)
-        else:
-            if config_value is not None:
+        if config_value is not None:
+            try:
+                parsed_config_value = float(config_value)
+            except (TypeError, ValueError):
                 logger.warning(
-                    "tuning.orchestrator.stalled_manager_threshold_s=%r must be a positive, "
-                    "finite number of seconds; falling back to the %.1fs default",
+                    "tuning.orchestrator.stalled_manager_threshold_s=%r is not a valid float; "
+                    "falling back to the %.1fs default",
                     config_value,
                     STALL_THRESHOLD_S,
                 )
+            else:
+                if _is_sane_threshold(parsed_config_value):
+                    resolved = parsed_config_value
+                else:
+                    logger.warning(
+                        "tuning.orchestrator.stalled_manager_threshold_s=%r must be a positive, "
+                        "finite number of seconds; falling back to the %.1fs default",
+                        config_value,
+                        STALL_THRESHOLD_S,
+                    )
+        if resolved is None:
             resolved = STALL_THRESHOLD_S
 
     # Race-check runs for every resolution path (env, config, and default),

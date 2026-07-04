@@ -380,6 +380,17 @@ def test_resolve_threshold_inf_env_falls_back(monkeypatch: Any) -> None:
     assert _resolve_stall_threshold_s(orch) == 222.0
 
 
+def test_resolve_threshold_unparseable_config_falls_back_to_default(monkeypatch: Any, caplog: Any) -> None:
+    """A non-numeric config value (malformed YAML, test double) must fall back with a
+    warning instead of raising uncaught - mirrors the env-var branch's behavior (#2182)."""
+    monkeypatch.delenv(STALL_THRESHOLD_ENV_VAR, raising=False)
+    orch = SimpleNamespace(_config=SimpleNamespace(stalled_manager_threshold_s="notanumber"))
+    with caplog.at_level("WARNING"):
+        result = _resolve_stall_threshold_s(orch)
+    assert result == STALL_THRESHOLD_S
+    assert "not a valid float" in caplog.text
+
+
 def test_resolve_threshold_non_positive_config_falls_back_to_default(monkeypatch: Any, caplog: Any) -> None:
     monkeypatch.delenv(STALL_THRESHOLD_ENV_VAR, raising=False)
     orch = SimpleNamespace(_config=SimpleNamespace(stalled_manager_threshold_s=-10.0))
