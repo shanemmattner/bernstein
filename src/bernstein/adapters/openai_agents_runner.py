@@ -449,10 +449,83 @@ def _build_agent_kwargs(manifest: RunnerManifest) -> dict[str, Any]:
     return kwargs
 
 
+# Alibaba Cloud (DashScope/MaaS) OpenAI-compatible endpoints. Substring match
+# against ``base_url`` - covers both the public DashScope host
+# (``dashscope.aliyuncs.com``) and the MaaS variant
+# (``maas.aliyuncs.com``) mentioned in Alibaba's own function-calling docs.
+_ALIBABA_BASE_URL_MARKERS: tuple[str, ...] = ("aliyuncs.com",)
+
+
+def _is_alibaba_cloud_endpoint(base_url: str | None) -> bool:
+    """Return whether *base_url* points at an Alibaba Cloud endpoint.
+
+    Qwen 3.x models served via Alibaba Cloud (DashScope/MaaS) default to
+    "thinking" mode, which makes the model reason its way out of calling
+    tools and write ad-hoc scripts instead - Alibaba's own function-calling
+    docs show ``extra_body={"enable_thinking": False}`` on every
+    tool-calling request as the fix. Detection is a simple substring match
+    so both the public DashScope host and any ``*.aliyuncs.com`` MaaS
+    variant are covered without hardcoding a specific hostname.
+    """
+    return bool(base_url) and any(marker in cast("str", base_url) for marker in _ALIBABA_BASE_URL_MARKERS)
+
+
+def _inject_alibaba_enable_thinking(
+    kwargs: dict[str, Any],
+    base_url: str | None,
+    *,
+    context: str,
+) -> dict[str, Any]:
+    """Merge ``extra_body={"enable_thinking": False}`` into *kwargs* for Alibaba endpoints.
+
+    No-op when *base_url* is not an Alibaba Cloud endpoint (see
+    :func:`_is_alibaba_cloud_endpoint`) or when ``enable_thinking`` is
+    already present in an existing ``extra_body`` (an explicit manifest
+    value always wins over this auto-injection). Mutates and returns
+    *kwargs* in place for convenient call-site chaining.
+
+    Args:
+        kwargs: The in-progress ``ModelSettings`` kwargs dict.
+        base_url: The endpoint this call is bound for.
+        context: Human-readable label (session id / council member) logged
+            alongside the injection so it is diagnosable from the runner
+            log alone (lessons.md rule 2).
+
+    Returns:
+        *kwargs*, with ``extra_body.enable_thinking`` set to ``False`` when
+        applicable.
+    """
+    if not _is_alibaba_cloud_endpoint(base_url):
+        return kwargs
+    extra_body: dict[str, Any] = dict(kwargs.get("extra_body") or {})
+    if "enable_thinking" in extra_body:
+        logger.info(
+            "%s: base_url=%r is Alibaba Cloud but extra_body.enable_thinking=%r is "
+            "already set - leaving the explicit value in place",
+            context,
+            base_url,
+            extra_body["enable_thinking"],
+        )
+        return kwargs
+    extra_body["enable_thinking"] = False
+    kwargs["extra_body"] = extra_body
+    logger.info(
+        "%s: base_url=%r matches Alibaba Cloud (aliyuncs.com) - injecting "
+        "extra_body={'enable_thinking': False} so tool calling is reliable "
+        "(Qwen 3.x reasons its way out of tool calls and writes ad-hoc "
+        "scripts instead when thinking mode is left on for function-calling "
+        "requests - see Alibaba's own function-calling docs)",
+        context,
+        base_url,
+    )
+    return kwargs
+
+
 def _build_model_settings_kwargs(
     manifest: RunnerManifest,
     *,
     model_settings_cls: type[Any] | None = None,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     """Translate optional sampling params into ``ModelSettings`` kwargs.
 
@@ -467,6 +540,16 @@ def _build_model_settings_kwargs(
     when ``None`` the field is not forwarded (the SDK is not loaded, e.g. in
     unit tests), keeping the kwargs SDK-version safe.
 
+    Args:
+        base_url: The single-model endpoint this run is bound for (``None``
+            for the default OpenAI endpoint, or when a council role is
+            active - council members resolve their OWN per-member
+            ``base_url`` in :mod:`bernstein.adapters.council_runner`
+            instead, since each candidate/judge may target a different
+            endpoint). When set and it is an Alibaba Cloud endpoint,
+            ``extra_body={"enable_thinking": False}`` is injected - see
+            :func:`_inject_alibaba_enable_thinking`.
+
     Returns:
         Kwargs for ``agents.ModelSettings``, possibly empty.
     """
@@ -479,6 +562,11 @@ def _build_model_settings_kwargs(
         kwargs["extra_args"] = {"top_k": manifest.top_k}
     if manifest.max_tokens and _model_settings_accepts(model_settings_cls, "max_tokens"):
         kwargs["max_tokens"] = manifest.max_tokens
+    kwargs = _inject_alibaba_enable_thinking(
+        kwargs,
+        base_url,
+        context=f"openai_agents_runner session={manifest.session_id}",
+    )
     return kwargs
 
 
@@ -1346,7 +1434,18 @@ def _run_session(manifest: RunnerManifest, client_kwargs: dict[str, Any]) -> int
                         manifest.model,
                     )
 
-        settings_kwargs = _build_model_settings_kwargs(manifest, model_settings_cls=sdk.ModelSettings)
+        # Council roles resolve their own per-member base_url independently
+        # (see council_runner._run_candidate/_run_judge) since each
+        # candidate/judge may target a different endpoint - the top-level
+        # manifest.base_url must not be applied to the shared base agent in
+        # that case, or every council member would inherit the enable_thinking
+        # override intended for only one of them.
+        settings_base_url = None if manifest.council is not None else manifest.base_url
+        settings_kwargs = _build_model_settings_kwargs(
+            manifest,
+            model_settings_cls=sdk.ModelSettings,
+            base_url=settings_base_url,
+        )
         if settings_kwargs:
             agent_kwargs["model_settings"] = sdk.ModelSettings(**settings_kwargs)
         agent: Any = agent_cls(**agent_kwargs)

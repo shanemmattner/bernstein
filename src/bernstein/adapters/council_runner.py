@@ -121,6 +121,52 @@ def _resolve_member_client_kwargs(member: dict[str, Any]) -> dict[str, Any]:
     return _resolve_council_member_client_kwargs(member)
 
 
+def _build_member_model_settings(agent: Any, member: dict[str, Any], *, label: str) -> Any | None:
+    """Build a per-member ``ModelSettings`` override for Alibaba Cloud endpoints.
+
+    Each council candidate/judge may target a different ``base_url``, so
+    the Alibaba ``enable_thinking: False`` injection (see
+    ``openai_agents_runner._inject_alibaba_enable_thinking`` - Qwen 3.x
+    otherwise reasons its way out of tool calls) must be evaluated per
+    member rather than once on the shared base agent. Starts from the base
+    agent's OWN ``model_settings`` (so any top-level temperature/top_p/etc.
+    the manifest already resolved onto it survives the clone) and only adds
+    ``extra_body.enable_thinking`` on top - never replaces the whole object.
+
+    Returns:
+        A ``ModelSettings`` instance to pass to ``agent.clone(model_settings=...)``,
+        or ``None`` when this member's endpoint is not Alibaba Cloud (the
+        caller should omit ``model_settings`` entirely so ``clone()`` keeps
+        the base agent's settings unchanged).
+    """
+    from agents import ModelSettings  # type: ignore[import-not-found]
+
+    from bernstein.adapters.openai_agents_runner import (
+        _inject_alibaba_enable_thinking,
+        _is_alibaba_cloud_endpoint,
+    )
+
+    base_url = member.get("base_url")
+    if not _is_alibaba_cloud_endpoint(base_url):
+        return None
+
+    base_model_settings = getattr(agent, "model_settings", None)
+    existing_kwargs: dict[str, Any] = {}
+    if base_model_settings is not None:
+        for f in dataclasses.fields(base_model_settings):
+            value = getattr(base_model_settings, f.name)
+            if value is not None:
+                existing_kwargs[f.name] = value
+
+    merged_kwargs = _inject_alibaba_enable_thinking(
+        existing_kwargs,
+        base_url,
+        context=f"run_council member {label}",
+    )
+    model_settings_cls = type(base_model_settings) if base_model_settings is not None else ModelSettings
+    return model_settings_cls(**merged_kwargs)
+
+
 async def _run_candidate(
     index: int,
     member: dict[str, Any],
@@ -148,7 +194,11 @@ async def _run_candidate(
     client = AsyncOpenAI(**client_kwargs)
 
     candidate_model = OpenAIChatCompletionsModel(model=model_id, openai_client=client)
-    candidate_agent = agent.clone(model=candidate_model)
+    candidate_model_settings = _build_member_model_settings(agent, member, label=label)
+    clone_kwargs: dict[str, Any] = {"model": candidate_model}
+    if candidate_model_settings is not None:
+        clone_kwargs["model_settings"] = candidate_model_settings
+    candidate_agent = agent.clone(**clone_kwargs)
 
     run_kwargs: dict[str, Any] = {} if max_turns is None else {"max_turns": max_turns}
     logger.info(
@@ -238,10 +288,14 @@ async def _run_judge(
     client_kwargs = _resolve_member_client_kwargs(judge_member)
     client = AsyncOpenAI(**client_kwargs)
     judge_model = OpenAIChatCompletionsModel(model=model_id, openai_client=client)
+    judge_model_settings = _build_member_model_settings(agent, judge_member, label=f"judge={model_id}")
     # Strip tools/handoffs: the judge only ever reads text and produces
     # text - it must never attempt to call a tool the original task agent
     # had access to.
-    judge_agent = agent.clone(model=judge_model, tools=[], handoffs=[])
+    judge_clone_kwargs: dict[str, Any] = {"model": judge_model, "tools": [], "handoffs": []}
+    if judge_model_settings is not None:
+        judge_clone_kwargs["model_settings"] = judge_model_settings
+    judge_agent = agent.clone(**judge_clone_kwargs)
 
     candidate_sections = "\n\n".join(
         f"### Candidate: {label}\n{output_text}" for label, output_text in candidate_outputs
