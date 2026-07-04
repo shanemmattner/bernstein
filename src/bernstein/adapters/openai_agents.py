@@ -293,6 +293,20 @@ class OpenAIAgentsAdapter(PluginAdapter):
             task_id = mcp_config.get("task_id")
             if isinstance(task_id, str) and task_id:
                 overrides["task_id"] = task_id
+            # Bug fix (instrumentation audit, bug 3 - "4 of 9 implement
+            # tasks have zero instrumentation"): spawner_core batches
+            # multiple tasks onto a single agent process for role-batched
+            # spawns, but only ever injected ``task_id`` (tasks[0].id) here
+            # - every other task in the batch got zero instrumentation
+            # coverage since the runner only knew about one task_id. When
+            # present, ``task_ids`` carries the full batch so the runner can
+            # fan instrumentation out to every task involved (see
+            # RunnerManifest.task_ids / RunInstrumenter.extra_dirs).
+            task_ids = mcp_config.get("task_ids")
+            if isinstance(task_ids, list) and task_ids:
+                cleaned_task_ids = [t for t in task_ids if isinstance(t, str) and t]
+                if cleaned_task_ids:
+                    overrides["task_ids"] = cleaned_task_ids
             # Wave 3 (per-agent instrumentation): orchestrator-root
             # directory injected by spawner_core (mirrors heartbeat_dir
             # above). ``workdir`` is a per-session worktree under default
