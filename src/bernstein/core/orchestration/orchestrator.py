@@ -487,7 +487,7 @@ class Orchestrator:
         # cap (set by ``bernstein run --hard-budget``). Attach a rolling
         # JSONL ledger so per-call attribution lands in
         # ``.sdd/cost/ledger.jsonl``.
-        run_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        run_id = os.environ.get("BERNSTEIN_RUN_ID") or datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         self._run_id = run_id
         hard_budget_usd = 0.0
         _raw_hard = os.environ.get("BERNSTEIN_HARD_BUDGET_USD", "").strip()
