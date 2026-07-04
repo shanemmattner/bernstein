@@ -148,6 +148,12 @@ _BASE_ALLOWLIST: frozenset[str] = frozenset(
         # pass through build_filtered_env() or the runner falls back to a
         # default tool source instead of the one the operator configured.
         "BERNSTEIN_OPENAI_AGENTS_TOOL_SOURCE",
+        # ``BERNSTEIN_BUILTIN_ALLOW_RUN_COMMAND`` opts the spawned openai_agents
+        # runner into registering the builtin run_command tool. Set alongside
+        # BERNSTEIN_OPENAI_AGENTS_TOOL_SOURCE=builtin in run.py; without it in
+        # the passthrough set the filtered env drops it and the manager agent's
+        # run_command calls fail with ModelBehaviorError: Tool run_command not found.
+        "BERNSTEIN_BUILTIN_ALLOW_RUN_COMMAND",
     }
 )
 
