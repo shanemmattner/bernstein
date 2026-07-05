@@ -205,14 +205,14 @@ class TestSlidingWindows:
     def test_error_rate_all_failures(self) -> None:
         now = time.time()
         guard = self._guard()
-        for i in range(3):
+        for i in range(5):
             guard.record_failure(now=now - i * 10)
         assert guard.current_error_rate(now=now) == pytest.approx(1.0, abs=0.01)
 
     def test_error_rate_pruning_removes_old_failures(self) -> None:
         now = time.time()
         guard = ConvergenceGuard(ConvergenceGuardConfig(error_rate_window_seconds=60))
-        # 5 old failures outside window, 2 recent successes inside
+        # 5 old failures outside window, 5 recent successes inside (min-sample floor = 5)
         guard.record_failure(now=now - 120)
         guard.record_failure(now=now - 120)
         guard.record_failure(now=now - 120)
@@ -220,6 +220,9 @@ class TestSlidingWindows:
         guard.record_failure(now=now - 120)
         guard.record_success(now=now - 10)
         guard.record_success(now=now - 20)
+        guard.record_success(now=now - 30)
+        guard.record_success(now=now - 40)
+        guard.record_success(now=now - 50)
         rate = guard.current_error_rate(now=now)
         assert rate == pytest.approx(0.0)  # old failures pruned, only successes remain
 
