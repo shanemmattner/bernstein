@@ -911,6 +911,7 @@ def _read_runner_cost_usd(
     return price_result.cost_usd, total_in, total_out
 
 
+
 # Failure types detected via log-pattern scanning that are unambiguous,
 # fatal, and MUST fail/retry the task immediately rather than falling
 # through to the generic "died without output" path (which defers behind
@@ -934,7 +935,6 @@ def _read_runner_cost_usd(
 _FAST_FAIL_LOG_FAILURE_TYPES: frozenset[str] = frozenset({"max_turns", "timeout", "auth_error", "api_error"})
 
 
-
 def _handle_failure_detection(
     orch: Any,
     task: Task,
@@ -944,7 +944,11 @@ def _handle_failure_detection(
     start_ts: float,
     tasks_snapshot: dict[str, list[Task]],
 ) -> bool:
-    """Detect rate-limit/context-overflow failures and handle them. Returns True if handled."""
+    """Detect fatal failure signatures in the agent log and handle them.
+
+    Returns True if handled (task already failed/retried/compacted - caller
+    must not fall through to the generic orphan-no-signals path).
+    """
     _rl_tracker = getattr(orch, "_rate_limit_tracker", None)
     if _rl_tracker is None or not session.provider:
         return False
@@ -1002,7 +1006,10 @@ def _handle_failure_detection(
         return True
 
     if _failure_type in _FAST_FAIL_LOG_FAILURE_TYPES:
-        reason = f"Agent {session.id} died; {_failure_type} detected in agent log (exit_code={session.exit_code!r})"
+        reason = (
+            f"Agent {session.id} died; {_failure_type} detected in agent log "
+            f"(exit_code={session.exit_code!r})"
+        )
         try:
             retry_or_fail_task(
                 task_id,
@@ -1025,7 +1032,6 @@ def _handle_failure_detection(
         emit_orphan_metrics(orch._workdir, task_id, session, start_ts, success=False, error_type=_failure_type)
         orch._record_provider_health(session, success=False)
         return True
-
 
     return False
 
