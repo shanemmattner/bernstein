@@ -65,6 +65,22 @@ RUN_ID_ENV_VAR = "BERNSTEIN_RUN_ID"
 _ARG_VALUE_TRUNCATE_CHARS = 500
 _TRUNCATE_MARKER = "...[truncated]"
 
+# Truncation cap for a single conversation message's ``content`` (bug fix,
+# 2026-07-04: log_message() previously recorded only content_length, never
+# the actual text, making conversation.jsonl useless for debugging what an
+# agent actually said - see commit b38fc3fe). 2000 chars is enough to see
+# the shape/gist of a message without conversation.jsonl growing unbounded
+# on a long run.
+_MESSAGE_CONTENT_TRUNCATE_CHARS = 2000
+
+# Truncation cap for a tool call's ``result`` (bug fix, 2026-07-04:
+# log_tool_call() previously recorded only name/args/success, never what the
+# tool actually returned, making it impossible to see tool output without
+# re-running the agent - see commit b38fc3fe). 1000 chars is enough for a
+# preview of most tool outputs (file reads, command output, etc.) without
+# duplicating huge payloads into tool-calls.jsonl.
+_TOOL_RESULT_TRUNCATE_CHARS = 1000
+
 # Filesystem-safe shape for a single directory-name component. run_id arrives
 # via an environment variable and task_id/agent_id via the runner manifest,
 # so :func:`resolve_agent_dir` treats all three as untrusted before joining
@@ -334,12 +350,22 @@ class RunInstrumenter:
         success: bool,
         error: str | None = None,
         wall_ms: float | None = None,
+        result: Any = None,
     ) -> None:
         """Append one record to ``tool-calls.jsonl`` for a single tool invocation.
 
         ``args`` is truncated (see :func:`_truncate_value`) before being
-        written - never the full tool result, only the call's own
-        arguments.
+        written - never the full tool call arguments unbounded, only a
+        capped preview.
+
+        ``result`` (bug fix, 2026-07-04: see :data:`_TOOL_RESULT_TRUNCATE_CHARS`)
+        is the tool's own return value - whatever the caller's tool
+        implementation produced (a string, dict, etc.) - stringified and
+        truncated to :data:`_TOOL_RESULT_TRUNCATE_CHARS` characters before
+        being written under the ``result`` key. ``None`` (the default) omits
+        the key entirely, matching every call site that has no result to
+        report (e.g. a failed call where the error already carries the
+        relevant text).
         """
         try:
             if wall_ms is None:
@@ -354,6 +380,8 @@ class RunInstrumenter:
                 "success": success,
                 "error": error,
             }
+            if result is not None:
+                record["result"] = _truncate_value(result, max_chars=_TOOL_RESULT_TRUNCATE_CHARS)
             self._append_line(self._tool_calls_path(), record, kind="tool_call", key=call_id)
         except Exception as exc:  # intentional-broad-except: instrumentation must never raise
             logger.warning("RunInstrumenter.log_tool_call failed for call_id=%s: %s", sanitize_log(call_id), exc)
@@ -366,11 +394,18 @@ class RunInstrumenter:
         content_length: int,
         tool_calls: list[str] | None = None,
         ts: str | None = None,
+        content: str | None = None,
     ) -> None:
         """Append one record to ``conversation.jsonl`` for a new message.
 
-        Only shape metadata is recorded - never message content - per the
-        task spec's privacy/size constraint.
+        Shape metadata (``role``/``content_length``/``tool_calls``) is
+        always recorded. ``content`` (bug fix, 2026-07-04: see
+        :data:`_MESSAGE_CONTENT_TRUNCATE_CHARS`) is optional actual message
+        text, truncated to :data:`_MESSAGE_CONTENT_TRUNCATE_CHARS` characters
+        before being written under the ``content`` key - callers that only
+        have shape metadata (or that intentionally withhold content for
+        privacy/size reasons) pass ``None`` (the default) and the key is
+        omitted entirely, preserving the original shape-only behavior.
         """
         try:
             record: dict[str, Any] = {
@@ -381,6 +416,8 @@ class RunInstrumenter:
             }
             if tool_calls:
                 record["tool_calls"] = list(tool_calls)
+            if content is not None:
+                record["content"] = _truncate_value(content, max_chars=_MESSAGE_CONTENT_TRUNCATE_CHARS)
             self._append_line(self._conversation_path(), record, kind="message", key=str(idx))
         except Exception as exc:  # intentional-broad-except: instrumentation must never raise
             logger.warning("RunInstrumenter.log_message failed for idx=%s: %s", idx, exc)
