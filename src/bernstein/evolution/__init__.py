@@ -45,7 +45,10 @@ from bernstein.evolution.detector import (
     FailurePattern,
     FailureRecord,
     ImprovementOpportunity,
+    ModelRouteRecommendation,
     OpportunityDetector,
+    SuccessRateAdvisor,
+    SuccessRateAnalysis,
     UpgradeCategory,
 )
 from bernstein.evolution.gate import (
@@ -128,6 +131,7 @@ __all__ = [
     "MetricsAggregator",
     "MetricsCollector",
     "MetricsRecord",
+    "ModelRouteRecommendation",
     "OpportunityDetector",
     "OscillationGuard",
     "OscillationResult",
@@ -148,6 +152,8 @@ __all__ = [
     "RiskScorer",
     "SandboxResult",
     "SandboxValidator",
+    "SuccessRateAdvisor",
+    "SuccessRateAnalysis",
     "TaskMetrics",
     "TrendAnalysis",
     "UpgradeCategory",
@@ -252,6 +258,7 @@ class EvolutionCoordinator:
         self.collector = collector or FileMetricsCollector(state_dir)
         self.executor = executor or FileUpgradeExecutor(state_dir)
         self._failure_analyzer = FailureAnalyzer(state_dir)
+        self._success_rate_advisor = SuccessRateAdvisor(self.collector)
         self.analysis_engine = AnalysisEngine(self.collector, failure_analyzer=self._failure_analyzer)
         self.analysis_interval_minutes = analysis_interval_minutes
 
@@ -318,6 +325,11 @@ class EvolutionCoordinator:
                 self._pending_upgrades.append(emergency_proposal)
 
         self._last_analysis = time.time()
+
+        # Export routing hints so the orchestrator can bias model selection.
+        routing_hints_path = self.state_dir / "evolution" / "routing_hints.json"
+        self._success_rate_advisor.export_routing_hints(routing_hints_path)
+
         return proposals
 
     def _should_auto_approve(self, proposal: UpgradeProposal) -> bool:
@@ -380,11 +392,27 @@ class EvolutionCoordinator:
 
     def get_analysis_summary(self) -> dict[str, Any]:
         """Get a summary of the latest analysis."""
+        sr_analysis = self._success_rate_advisor.analyze()
         return {
             "last_analysis": self._last_analysis,
             "next_analysis_due": self._last_analysis + (self.analysis_interval_minutes * 60),
             "pending_upgrades": len(self._pending_upgrades),
             "applied_upgrades": len(self._applied_upgrades),
+            "success_rate": {
+                "overall": sr_analysis.overall_rate,
+                "total_tasks": sr_analysis.total_tasks,
+                "by_role": sr_analysis.role_rates,
+                "routing_recommendations": [
+                    {
+                        "role": r.role,
+                        "model": r.model,
+                        "recommendation": r.recommendation,
+                        "success_rate": r.success_rate,
+                        "reason": r.reason,
+                    }
+                    for r in sr_analysis.routing_recommendations
+                ],
+            },
             "trends": [
                 {
                     "metric": t.metric_name,

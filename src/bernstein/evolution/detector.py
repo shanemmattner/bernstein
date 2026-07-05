@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
-    from bernstein.evolution.aggregator import MetricsCollector
+    from bernstein.evolution.aggregator import MetricsCollector, TaskMetrics
 
 
 class UpgradeCategory(Enum):
@@ -229,6 +229,171 @@ class FailureAnalyzer:
         return {model: count / total for model, count in model_counts.items()}
 
 
+@dataclass
+class ModelRouteRecommendation:
+    """A specific routing recommendation for a role/model combination."""
+
+    role: str
+    model: str
+    success_rate: float
+    failure_count: int
+    recommendation: Literal["avoid", "prefer"]
+    reason: str
+
+
+@dataclass
+class SuccessRateAnalysis:
+    """Analysis of task success rates broken down by role and model."""
+
+    overall_rate: float
+    total_tasks: int
+    role_rates: dict[str, float]
+    model_rates: dict[str, float]
+    routing_recommendations: list[ModelRouteRecommendation]
+
+
+class SuccessRateAdvisor:
+    """Analyzes task success rates and generates model routing recommendations.
+
+    Computes per-role and per-(role, model) success rates from recent task
+    metrics, then recommends routing changes to steer tasks away from
+    poorly-performing model/role combinations toward high-performing ones.
+
+    The advisor requires at least ``_MIN_SAMPLES_PER_GROUP`` task metrics
+    for a (role, model) pair before emitting a recommendation for it, to
+    avoid acting on statistical noise.
+    """
+
+    _MIN_SAMPLES_PER_GROUP: int = 3
+    _AVOID_THRESHOLD: float = 0.5
+    _PREFER_THRESHOLD: float = 0.9
+
+    def __init__(
+        self,
+        collector: MetricsCollector,
+    ) -> None:
+        self.collector = collector
+
+    def analyze(self, hours: int = 24) -> SuccessRateAnalysis:
+        """Compute success rates and routing recommendations from recent metrics.
+
+        Args:
+            hours: How far back to look for task metrics.
+
+        Returns:
+            A :class:`SuccessRateAnalysis` with per-role/model breakdowns and
+            concrete routing recommendations.
+        """
+        task_metrics: list[TaskMetrics] = self.collector.get_recent_task_metrics(hours=hours)
+        if not task_metrics:
+            return SuccessRateAnalysis(
+                overall_rate=0.0,
+                total_tasks=0,
+                role_rates={},
+                model_rates={},
+                routing_recommendations=[],
+            )
+
+        overall = sum(1 for m in task_metrics if m.janitor_passed) / len(task_metrics)
+
+        role_groups: dict[str, list[TaskMetrics]] = {}
+        for m in task_metrics:
+            role = m.role or "unknown"
+            role_groups.setdefault(role, []).append(m)
+
+        role_rates: dict[str, float] = {
+            role: sum(1 for m in ms if m.janitor_passed) / len(ms)
+            for role, ms in role_groups.items()
+        }
+
+        role_model_groups: dict[tuple[str, str], list[TaskMetrics]] = {}
+        for m in task_metrics:
+            key = (m.role or "unknown", m.model or "unknown")
+            role_model_groups.setdefault(key, []).append(m)
+
+        model_rates: dict[str, float] = {}
+        recommendations: list[ModelRouteRecommendation] = []
+
+        for (role, model), ms in sorted(role_model_groups.items()):
+            if len(ms) < self._MIN_SAMPLES_PER_GROUP:
+                continue
+            rate = sum(1 for m in ms if m.janitor_passed) / len(ms)
+            model_rates[f"{role}:{model}"] = rate
+            failures = sum(1 for m in ms if not m.janitor_passed)
+
+            if rate < self._AVOID_THRESHOLD:
+                recommendations.append(
+                    ModelRouteRecommendation(
+                        role=role,
+                        model=model,
+                        success_rate=rate,
+                        failure_count=failures,
+                        recommendation="avoid",
+                        reason=(
+                            f"{role} tasks using {model} fail "
+                            f"{1 - rate:.1%} of the time "
+                            f"({failures}/{len(ms)} failures in {hours}h)"
+                        ),
+                    )
+                )
+            elif rate >= self._PREFER_THRESHOLD:
+                recommendations.append(
+                    ModelRouteRecommendation(
+                        role=role,
+                        model=model,
+                        success_rate=rate,
+                        failure_count=failures,
+                        recommendation="prefer",
+                        reason=(
+                            f"{role} tasks using {model} succeed "
+                            f"{rate:.1%} of the time in {hours}h"
+                        ),
+                    )
+                )
+
+        return SuccessRateAnalysis(
+            overall_rate=overall,
+            total_tasks=len(task_metrics),
+            role_rates=role_rates,
+            model_rates=model_rates,
+            routing_recommendations=recommendations,
+        )
+
+    def export_routing_hints(self, output_path: Path) -> None:
+        """Write routing recommendations to a JSON file for the orchestrator.
+
+        The orchestrator reads this file on each tick to bias model selection
+        toward high-success combinations and away from low-success ones.
+        A missing or stale file is silently ignored by the orchestrator.
+
+        Args:
+            output_path: Destination path for the JSON output.
+        """
+        analysis = self.analyze()
+        data: dict[str, Any] = {
+            "generated_at": time.time(),
+            "overall_success_rate": analysis.overall_rate,
+            "total_tasks_analyzed": analysis.total_tasks,
+            "role_success_rates": analysis.role_rates,
+            "routing_recommendations": [
+                {
+                    "role": r.role,
+                    "model": r.model,
+                    "success_rate": r.success_rate,
+                    "failure_count": r.failure_count,
+                    "recommendation": r.recommendation,
+                    "reason": r.reason,
+                }
+                for r in analysis.routing_recommendations
+            ],
+        }
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            logger.exception("Failed to write routing hints to %s", output_path)
+
+
 class OpportunityDetector:
     """Identifies improvement opportunities from metrics."""
 
@@ -241,6 +406,7 @@ class OpportunityDetector:
         self.collector = collector
         self.failure_analyzer = failure_analyzer
         self._analysis_dir = analysis_dir
+        self._success_rate_advisor = SuccessRateAdvisor(collector)
 
     def identify_opportunities(self) -> list[ImprovementOpportunity]:
         """Identify improvement opportunities from recent metrics."""
@@ -265,16 +431,40 @@ class OpportunityDetector:
                     )
                 )
 
-        # Check for success rate improvements
-        task_metrics = self.collector.get_recent_task_metrics(hours=24)
-        if task_metrics:
-            pass_rate = sum(1 for m in task_metrics if m.janitor_passed) / len(task_metrics)
-            if pass_rate < 0.8:
+        # Check for success rate improvements using the advisor for specificity
+        analysis = self._success_rate_advisor.analyze(hours=24)
+        if analysis.total_tasks > 0 and analysis.overall_rate < 0.8:
+            avoid_recs = [r for r in analysis.routing_recommendations if r.recommendation == "avoid"]
+            if avoid_recs:
+                # Emit a targeted opportunity per problematic role/model pair
+                for rec in avoid_recs:
+                    opportunities.append(
+                        ImprovementOpportunity(
+                            category=UpgradeCategory.MODEL_ROUTING,
+                            title="Improve task success rate",
+                            description=(
+                                f"Current success rate is {analysis.overall_rate:.1%}, target is 80%. "
+                                f"{rec.reason}"
+                            ),
+                            expected_improvement=(
+                                f"Routing {rec.role} tasks away from {rec.model} "
+                                f"should reduce failure rate by up to "
+                                f"{(0.8 - analysis.overall_rate):.1%}"
+                            ),
+                            confidence=min(0.9, 0.5 + rec.failure_count * 0.05),
+                            risk_level="medium",
+                            affected_components=["model_routing", rec.role],
+                        )
+                    )
+            else:
+                # No specific routing culprit — emit the generic proposal
                 opportunities.append(
                     ImprovementOpportunity(
                         category=UpgradeCategory.MODEL_ROUTING,
                         title="Improve task success rate",
-                        description=f"Current success rate is {pass_rate:.1%}, target is 80%",
+                        description=(
+                            f"Current success rate is {analysis.overall_rate:.1%}, target is 80%"
+                        ),
                         expected_improvement="Higher quality output, fewer fix tasks",
                         confidence=0.8,
                         risk_level="medium",
