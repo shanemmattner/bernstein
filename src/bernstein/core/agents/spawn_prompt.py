@@ -1061,6 +1061,54 @@ def _render_prompt(
         nudges_block = "\n## Operational nudges\n" + "\n".join(f"- {m}" for m in meta_messages) + "\n"
         named_sections.append(("meta nudges", nudges_block))
 
+    # Turn-budget nudge (work/bernstein/m27-nudge-plan.md, Approach C
+    # MINIMAL) - see the sibling implementation/rationale in
+    # bernstein.core.agents.spawner_core._render_prompt, which is the
+    # actually-live production render path; this module's _render_prompt
+    # is kept in sync for test coverage (tests/unit/agents/test_spawn_prompt_pure.py)
+    # and any future caller that switches to it.
+    if max_turns is not None and max_turns > 0:
+        halfway_turn = max(1, max_turns // 2)
+        near_end_turn = max(halfway_turn + 1, min(max_turns, max_turns - 3))
+        turn_budget_block = (
+            "\n## Turn budget\n"
+            f"You have a hard budget of {max_turns} tool-use turns for this task.\n\n"
+            f"- By turn {halfway_turn} (roughly halfway): if the core task is already "
+            "done, STOP - write your final summary now. Do not spend remaining turns "
+            "re-reading files you've already read or re-verifying work that already "
+            "passed.\n"
+            f"- By turn {near_end_turn} (near your limit): if you have not yet written "
+            "any code/output, you are out of time for further exploration - write "
+            "SOMETHING now, even a partial/best-effort change, rather than continuing "
+            "to read.\n"
+            "- On your FINAL turn: your last message must be plain text summarizing "
+            "what you accomplished, what remains unfinished, and any risks. Do not "
+            "attempt further tool calls.\n\n"
+            "STOP CONDITIONS - if any of these are true, stop immediately and write "
+            "your summary:\n"
+            "- All requested changes are implemented and tests pass\n"
+            "- You have verified your work is correct\n"
+            "- You are re-reading files you already read with no new information to "
+            "gain\n"
+        )
+        named_sections.append(("turn budget", turn_budget_block))
+        logger.info(
+            "Turn budget nudge injected for role=%s session=%s: max_turns=%d halfway=%d near_end=%d",
+            role,
+            session_id,
+            max_turns,
+            halfway_turn,
+            near_end_turn,
+        )
+    else:
+        logger.info(
+            "Turn budget nudge skipped for role=%s session=%s: max_turns not available "
+            "at prompt-build time (resolved value=%r)",
+            role,
+            session_id,
+            max_turns,
+        )
+
     # Strip empty/whitespace-only sections before compression
     named_sections = [(name, content) for name, content in named_sections if content and content.strip()]
 
@@ -1195,6 +1243,7 @@ def render_prompt(
     task_graph: TaskGraph | None = None,
     meta_messages: list[str] | None = None,
     file_ownership: dict[str, str] | None = None,
+    max_turns: int | None = None,
 ) -> str:
     """Public wrapper for compatibility-safe prompt rendering.
 
@@ -1215,6 +1264,7 @@ def render_prompt(
         task_graph=task_graph,
         meta_messages=meta_messages,
         file_ownership=file_ownership,
+        max_turns=max_turns,
     )
     _observe_cache_locality(rendered, tasks)
     return rendered
