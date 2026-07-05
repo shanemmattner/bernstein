@@ -43,7 +43,7 @@ import json
 import logging
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -142,16 +142,26 @@ class RunInstrumenter:
     write a line is logged at WARNING and swallowed, never raised, so a full
     disk / permissions problem / serialization bug can never take down the
     agent run being observed.
+
+    ``extra_dirs`` (Bug fix, instrumentation audit bug 3): when this agent
+    process is working a BATCH of tasks in one session (see
+    ``RunnerManifest.task_ids`` in :mod:`bernstein.adapters.openai_agents_runner`),
+    every JSONL record written to ``base_dir`` is ALSO fanned out to each
+    directory in ``extra_dirs`` so every task in the batch gets a full copy
+    of this agent's instrumentation, not just the primary task. Defaults to
+    an empty list (no fan-out) for the common single-task case.
     """
 
     run_id: str
     task_id: str
     agent_id: str
     base_dir: Path
+    extra_dirs: list[Path] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
         self._dir_ready = False
+        self._extra_dirs_ready: list[Path] = []
         try:
             self.base_dir.mkdir(parents=True, exist_ok=True)
             self._dir_ready = True
@@ -176,6 +186,33 @@ class RunInstrumenter:
                 sanitize_log(self.agent_id),
                 exc,
             )
+        if self.extra_dirs:
+            for extra_dir in self.extra_dirs:
+                try:
+                    extra_dir.mkdir(parents=True, exist_ok=True)
+                    self._extra_dirs_ready.append(extra_dir)
+                except OSError as exc:
+                    logger.warning(
+                        "RunInstrumenter: failed to create extra (batch fan-out) "
+                        "instrumentation dir %s (run_id=%s task_id=%s agent_id=%s): %s - "
+                        "fan-out to this dir is DISABLED, other dirs and the agent run "
+                        "are unaffected",
+                        extra_dir,
+                        sanitize_log(self.run_id),
+                        sanitize_log(self.task_id),
+                        sanitize_log(self.agent_id),
+                        exc,
+                    )
+            logger.info(
+                "RunInstrumenter: batch fan-out enabled for run_id=%s task_id=%s agent_id=%s -> "
+                "%d/%d extra dir(s) ready: %s",
+                sanitize_log(self.run_id),
+                sanitize_log(self.task_id),
+                sanitize_log(self.agent_id),
+                len(self._extra_dirs_ready),
+                len(self.extra_dirs),
+                self._extra_dirs_ready,
+            )
 
     # -- path helpers ---------------------------------------------------
 
@@ -198,6 +235,11 @@ class RunInstrumenter:
         threads in the SAME process racing on the SAME file (e.g. a
         heartbeat thread and the main thread); separate agent PROCESSES
         never share a base_dir so no cross-process lock is needed.
+
+        ``path`` is expected to be ``self.base_dir / <filename>``; when
+        ``extra_dirs`` (batch fan-out) is non-empty, the same record is also
+        appended to ``<extra_dir> / <same filename>`` for every ready extra
+        dir, so every task in a batch sees the full record stream.
         """
         if not self._dir_ready:
             return
@@ -208,14 +250,25 @@ class RunInstrumenter:
                 "RunInstrumenter: failed to serialize %s record %s=%s: %s", kind, kind, sanitize_log(key), exc
             )
             return
-        try:
-            with self._lock, path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-            logger.debug("RunInstrumenter: wrote %s record %s=%s to %s", kind, kind, sanitize_log(key), path)
-        except OSError as exc:
-            logger.warning(
-                "RunInstrumenter: failed to write %s record %s=%s to %s: %s", kind, kind, sanitize_log(key), path, exc
-            )
+        write_paths = [path]
+        if self._extra_dirs_ready:
+            write_paths.extend(extra_dir / path.name for extra_dir in self._extra_dirs_ready)
+        for target_path in write_paths:
+            try:
+                with self._lock, target_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+                logger.debug(
+                    "RunInstrumenter: wrote %s record %s=%s to %s", kind, kind, sanitize_log(key), target_path
+                )
+            except OSError as exc:
+                logger.warning(
+                    "RunInstrumenter: failed to write %s record %s=%s to %s: %s",
+                    kind,
+                    kind,
+                    sanitize_log(key),
+                    target_path,
+                    exc,
+                )
 
     # -- public API -------------------------------------------------------
 
@@ -395,16 +448,43 @@ def resolve_agent_dir(workdir: Path, run_id: str, task_id: str, agent_id: str) -
     )
 
 
-def init_instrumenter(*, run_id: str, task_id: str, agent_id: str, base_dir: Path) -> RunInstrumenter:
+def init_instrumenter(
+    *,
+    run_id: str,
+    task_id: str,
+    agent_id: str,
+    base_dir: Path,
+    extra_dirs: list[Path] | None = None,
+) -> RunInstrumenter:
     """Create and install the process-wide :class:`RunInstrumenter` singleton.
 
     Safe to call more than once (e.g. a test re-initializing between cases);
     each call replaces the previous singleton. Never raises - construction
     failures are caught inside :meth:`RunInstrumenter.__post_init__` and
     degrade to a disabled-but-non-crashing instance.
+
+    ``extra_dirs``: additional per-agent instrumentation directories (one per
+    OTHER task in a batch this agent process is working) that every JSONL
+    write should be fanned out to, in addition to ``base_dir``. See
+    :class:`RunInstrumenter`'s ``extra_dirs`` docstring and the call site in
+    :func:`bernstein.adapters.openai_agents_runner.run` (batch instrumentation
+    fan-out, instrumentation audit bug 3). Defaults to none.
     """
     global _instrumenter
-    instrumenter = RunInstrumenter(run_id=run_id, task_id=task_id, agent_id=agent_id, base_dir=base_dir)
+    resolved_extra_dirs = list(extra_dirs or [])
+    logger.info(
+        "init_instrumenter: run_id=%s task_id=%s agent_id=%s base_dir=%s extra_dirs=%s "
+        "(%d extra dir(s) requested for batch fan-out)",
+        sanitize_log(run_id),
+        sanitize_log(task_id),
+        sanitize_log(agent_id),
+        base_dir,
+        resolved_extra_dirs,
+        len(resolved_extra_dirs),
+    )
+    instrumenter = RunInstrumenter(
+        run_id=run_id, task_id=task_id, agent_id=agent_id, base_dir=base_dir, extra_dirs=resolved_extra_dirs
+    )
     with _instrumenter_lock:
         _instrumenter = instrumenter
     return instrumenter
