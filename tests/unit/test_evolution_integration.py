@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 
 from bernstein.core.evolution import (
     EvolutionCoordinator,
+    FailureAnalyzer,
     FileMetricsCollector,
     FileUpgradeExecutor,
     TaskMetrics,
@@ -322,3 +323,134 @@ class TestEvolutionEndToEnd:
 
         # Immediately after - should not run
         assert coordinator.should_run_analysis() is False
+
+
+class TestFailureAnalyzerWiring:
+    """Verify EvolutionCoordinator wires FailureAnalyzer into task completion recording."""
+
+    def test_janitor_failure_recorded_to_failure_analyzer(self, tmp_path: Path, make_task) -> None:
+        """Failed janitor results are persisted to the FailureAnalyzer."""
+        state_dir = tmp_path / ".sdd"
+        state_dir.mkdir()
+
+        coordinator = EvolutionCoordinator(state_dir=state_dir)
+
+        task = make_task(id="T-fail-1", role="backend")
+        coordinator.record_task_completion(
+            task=task,
+            duration_seconds=30.0,
+            cost_usd=0.05,
+            janitor_passed=False,
+            model="sonnet",
+            failure_reason="empty_diff",
+        )
+
+        # FailureAnalyzer should have persisted the failure
+        failures_path = state_dir / "evolution" / "failures.jsonl"
+        assert failures_path.exists()
+        lines = failures_path.read_text().strip().split("\n")
+        assert len(lines) == 1
+        record = json.loads(lines[0])
+        assert record["task_id"] == "T-fail-1"
+        assert record["role"] == "backend"
+        assert record["error_type"] == "empty_diff"
+        assert record["model"] == "sonnet"
+
+    def test_janitor_pass_does_not_record_failure(self, tmp_path: Path, make_task) -> None:
+        """Successful completions are NOT written to the failures log."""
+        state_dir = tmp_path / ".sdd"
+        state_dir.mkdir()
+
+        coordinator = EvolutionCoordinator(state_dir=state_dir)
+
+        task = make_task(id="T-ok-1", role="backend")
+        coordinator.record_task_completion(
+            task=task,
+            duration_seconds=30.0,
+            cost_usd=0.05,
+            janitor_passed=True,
+            model="sonnet",
+        )
+
+        failures_path = state_dir / "evolution" / "failures.jsonl"
+        # File should not exist or be empty
+        if failures_path.exists():
+            content = failures_path.read_text().strip()
+            assert content == ""
+
+    def test_multiple_failures_enable_pattern_detection(self, tmp_path: Path, make_task) -> None:
+        """Three failures on the same role+error trigger failure opportunity detection."""
+        state_dir = tmp_path / ".sdd"
+        state_dir.mkdir()
+
+        coordinator = EvolutionCoordinator(state_dir=state_dir)
+
+        for i in range(3):
+            task = make_task(id=f"T-fail-{i}", role="backend")
+            coordinator.record_task_completion(
+                task=task,
+                duration_seconds=20.0,
+                cost_usd=0.02,
+                janitor_passed=False,
+                model="haiku",
+                failure_reason="completion_signal_mismatch",
+            )
+
+        # Seed passing metrics so analysis window is populated
+        _seed_task_metrics(coordinator.collector, count=20)
+
+        proposals = coordinator.run_analysis_cycle()
+        assert len(proposals) > 0
+
+    def test_files_modified_recorded_in_task_metrics(self, tmp_path: Path, make_task) -> None:
+        """files_modified, lines_added, lines_deleted are stored in task metrics."""
+        state_dir = tmp_path / ".sdd"
+        state_dir.mkdir()
+
+        coordinator = EvolutionCoordinator(state_dir=state_dir)
+
+        task = make_task(id="T-files-1", role="backend")
+        coordinator.record_task_completion(
+            task=task,
+            duration_seconds=45.0,
+            cost_usd=0.07,
+            janitor_passed=True,
+            model="sonnet",
+            files_modified=3,
+            lines_added=120,
+            lines_deleted=45,
+        )
+
+        tasks_jsonl = state_dir / "metrics" / "tasks.jsonl"
+        assert tasks_jsonl.exists()
+        record = json.loads(tasks_jsonl.read_text().strip())
+        assert record["files_modified"] == 3
+        assert record["lines_added"] == 120
+        assert record["lines_deleted"] == 45
+
+    def test_analysis_engine_uses_failure_analyzer(self, tmp_path: Path) -> None:
+        """AnalysisEngine passes FailureAnalyzer through to OpportunityDetector."""
+        from bernstein.core.evolution import AnalysisEngine
+
+        state_dir = tmp_path / ".sdd"
+        state_dir.mkdir()
+
+        collector = FileMetricsCollector(state_dir)
+        failure_analyzer = FailureAnalyzer(state_dir)
+
+        # Record 3 failures for the same role/error to create a pattern
+        for i in range(3):
+            failure_analyzer.record_failure(
+                task_id=f"T-{i}",
+                role="backend",
+                model="haiku",
+                error_type="timeout",
+            )
+
+        engine = AnalysisEngine(collector, failure_analyzer=failure_analyzer)
+        _seed_task_metrics(collector, count=20)
+        engine.run_analysis()
+
+        # Should find opportunities (both success rate and failure pattern)
+        opportunities = engine.get_opportunities()
+        assert len(opportunities) > 0
