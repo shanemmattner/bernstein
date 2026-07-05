@@ -985,6 +985,8 @@ def _render_prompt(
     # Team coordination: instruct agents to post discoveries and query peers
     if session_id:
         agent_id = session_id
+        team_coord_url = _resolve_server_url(server_url)
+        logger.info("Team coordination curl commands using server_url=%s", team_coord_url)
         named_sections.append(
             (
                 "team coordination",
@@ -992,7 +994,7 @@ def _render_prompt(
                     "\n## Team coordination\n"
                     "When you create a new file, define an API, or discover something other agents should know:\n"
                     "```bash\n"
-                    "curl -s -X POST http://127.0.0.1:8052/bulletin "
+                    f"curl -s -X POST {team_coord_url}/bulletin "
                     '-H "Content-Type: application/json" \\\n'
                     '  -d \'{"agent_id": "' + agent_id + '", "type": "finding", '
                     '"content": "<describe what you created or discovered>"}\'\n'
@@ -1004,7 +1006,7 @@ def _render_prompt(
                     "\n### Direct channel (agent-to-agent queries)\n"
                     "To ask another agent a question (e.g. about a schema or interface they own):\n"
                     "```bash\n"
-                    "curl -s -X POST http://127.0.0.1:8052/channel/query "
+                    f"curl -s -X POST {team_coord_url}/channel/query "
                     '-H "Content-Type: application/json" \\\n'
                     '  -d \'{"sender_agent": "' + agent_id + '", '
                     '"topic": "<short-topic>", '
@@ -1013,11 +1015,11 @@ def _render_prompt(
                     "```\n"
                     "Check for questions addressed to you:\n"
                     "```bash\n"
-                    "curl -s http://127.0.0.1:8052/channel/queries?agent_id=" + agent_id + "\n"
+                    f"curl -s {team_coord_url}/channel/queries?agent_id=" + agent_id + "\n"
                     "```\n"
                     "Respond to a query:\n"
                     "```bash\n"
-                    "curl -s -X POST http://127.0.0.1:8052/channel/<query_id>/respond "
+                    f"curl -s -X POST {team_coord_url}/channel/<query_id>/respond "
                     '-H "Content-Type: application/json" \\\n'
                     '  -d \'{"responder_agent": "' + agent_id + '", '
                     '"content": "<your answer>"}\'\n'

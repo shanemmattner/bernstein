@@ -19,11 +19,14 @@ environment variable expansion, and Unicode homoglyph evasion.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
+
+logger = logging.getLogger(__name__)
 
 
 class Decision(StrEnum):
@@ -516,6 +519,40 @@ def reload_extra_allow_patterns_from_env() -> None:
 _compiled_allow: list[re.Pattern[str]] = [re.compile(p) for p in _ALLOW_PATTERNS]
 _compiled_deny: list[re.Pattern[str]] = [re.compile(p) for p in _DENY_PATTERNS]
 
+
+def _build_server_url_allow_patterns() -> list[re.Pattern[str]]:
+    """Build allow patterns for curl calls to the *actual* resolved task server.
+
+    ``_ALLOW_PATTERNS`` above hardcodes the historical default port 8052,
+    which stops matching under ``--auto-port`` (a different port is bound).
+    This reads ``BERNSTEIN_SERVER_URL`` (same env var threaded by
+    ``cli/helpers.py`` and ``core/agents/spawn_prompt._resolve_server_url``)
+    and adds a matching allow pattern for the resolved host:port so agent
+    curl calls to their real completion/bulletin/channel endpoints still
+    auto-approve. Falls back to no-op (the static 8052 patterns still cover
+    the default case) when the env var is unset.
+    """
+    server_url = os.environ.get("BERNSTEIN_SERVER_URL")
+    if not server_url:
+        logger.info("BERNSTEIN_SERVER_URL not set; auto-approve relies on static 127.0.0.1:8052/localhost:8052 patterns only")
+        return []
+    escaped = re.escape(server_url)
+    logger.info("Building auto-approve curl allow pattern for resolved server_url=%s", server_url)
+    return [re.compile(rf"^curl\s+.*{escaped}")]
+
+
+_compiled_allow_dynamic: list[re.Pattern[str]] = _build_server_url_allow_patterns()
+
+
+def reload_server_url_allow_patterns_from_env() -> None:
+    """Re-read ``BERNSTEIN_SERVER_URL`` and rebuild the dynamic curl allow pattern.
+
+    Useful after mutating :data:`os.environ` at runtime (tests, hot-reload) --
+    mirrors :func:`reload_extra_allow_patterns_from_env`.
+    """
+    global _compiled_allow_dynamic
+    _compiled_allow_dynamic = _build_server_url_allow_patterns()
+
 # Non-bash tool allow-list: tools that are always safe to approve.
 #
 # Only read-only / no-side-effect tools belong here.  Write-capable tools
@@ -641,6 +678,9 @@ def _match_allow(cmd: str) -> str | None:
     override a deny match.
     """
     for pattern in _compiled_allow:
+        if pattern.search(cmd):
+            return pattern.pattern
+    for pattern in _compiled_allow_dynamic:
         if pattern.search(cmd):
             return pattern.pattern
     for pattern in _extra_allow:

@@ -1268,7 +1268,12 @@ class BernsteinApp(App[None]):
         """Start graceful drain with progress overlay."""
         from bernstein.cli.drain_screen import DrainScreen
 
-        self.push_screen(DrainScreen(), callback=self._on_drain_complete)
+        # Pass the dashboard's own resolved SERVER_URL explicitly instead of
+        # relying on DrainScreen's module-level default -- keeps the drain
+        # overlay talking to the same --auto-port-resolved server the rest
+        # of the dashboard polls (see dashboard_polling.SERVER_URL).
+        logger.info("Launching DrainScreen with server_url=%s", SERVER_URL)
+        self.push_screen(DrainScreen(server_url=SERVER_URL), callback=self._on_drain_complete)
 
     def _on_drain_complete(self, report: object) -> None:
         """Handle drain screen dismissal."""
