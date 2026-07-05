@@ -2967,6 +2967,8 @@ def _close_completed_task(orch: Any, task: Task) -> None:
     except Exception as exc:
         logger.warning("Failed to close task %s: %s", task.id, exc)
 
+    _propagate_retry_lineage_success(orch, task)
+
     issue_number = task.metadata.get("issue_number") if task.metadata else None
     if not issue_number:
         return
@@ -2978,6 +2980,92 @@ def _close_completed_task(orch: Any, task: Task) -> None:
         logger.info("Closed GitHub issue #%s for task %s", issue_number, task.id)
     except Exception as exc:
         logger.warning("Failed to close GitHub issue #%s: %s", issue_number, exc)
+
+
+def _propagate_retry_lineage_success(orch: Any, task: Task) -> None:
+    """Close every FAILED predecessor in ``task``'s retry lineage.
+
+    Bug fix (2026-07): ``retry_or_fail_task`` retries a task by creating a
+    BRAND NEW task id and marking the original id ``failed`` ("Retried:
+    ...") as a superseded placeholder - see that function's docstring. A
+    caller that watches a single task_id end-to-end (e.g. a phased-workflow
+    driver's ``poll_tasks_until_terminal`` loop, which polls exactly the id
+    it created) never learns that a replacement id exists. If that
+    replacement eventually succeeds, the original id it is watching was
+    stuck at terminal ``failed`` forever, even though the underlying work
+    genuinely completed - the workflow's success gate (which checks for
+    ``done``/``closed``, not just "any terminal status") would never fire.
+
+    This walks ``task``'s lineage (``task.metadata["original_task_id"]``,
+    falling back to ``task.id`` for a task that was never itself retried)
+    and closes every OTHER task sharing that lineage that is currently in
+    ``failed`` status, via the SAME ``close_task`` helper used for the
+    just-completed task above - no separate status-setting logic, so this
+    can never drift out of sync with the normal success path. Every
+    transition is logged so a silent no-op is impossible to overlook.
+    """
+    lineage_id = task.metadata.get("original_task_id", task.id) if isinstance(task.metadata, dict) else task.id
+    if not lineage_id:
+        return
+
+    server_url = getattr(orch._config, "server_url", None)
+    if not server_url:
+        logger.debug(
+            "retry-lineage propagation: task=%s lineage=%s skipped, no server_url on orch config",
+            task.id,
+            lineage_id,
+        )
+        return
+
+    try:
+        resp = orch._client.get(f"{server_url}/tasks", params={"status": "failed"})
+        resp.raise_for_status()
+        body = resp.json()
+        failed_tasks = body.get("tasks", body) if isinstance(body, dict) else body
+    except Exception as exc:
+        logger.warning(
+            "retry-lineage propagation: task=%s lineage=%s failed to list failed tasks: %s",
+            task.id,
+            lineage_id,
+            exc,
+        )
+        return
+
+    closed: list[str] = []
+    for raw in failed_tasks or []:
+        sibling_id = raw.get("id")
+        if not sibling_id or sibling_id == task.id:
+            continue
+        sibling_meta = raw.get("metadata") or {}
+        sibling_lineage = sibling_meta.get("original_task_id", sibling_id)
+        if sibling_lineage != lineage_id:
+            continue
+        try:
+            close_task(orch._client, server_url, sibling_id)
+            closed.append(sibling_id)
+            logger.info(
+                "retry-lineage propagation: task=%s (lineage=%s) succeeded -> transitioning "
+                "predecessor %s failed -> closed so any poller watching that id sees "
+                "terminal success",
+                task.id,
+                lineage_id,
+                sibling_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "retry-lineage propagation: task=%s lineage=%s failed to close predecessor %s: %s",
+                task.id,
+                lineage_id,
+                sibling_id,
+                exc,
+            )
+
+    if not closed:
+        logger.debug(
+            "retry-lineage propagation: task=%s lineage=%s succeeded, no failed predecessor(s) found",
+            task.id,
+            lineage_id,
+        )
 
 
 def _record_bandit_outcome(
