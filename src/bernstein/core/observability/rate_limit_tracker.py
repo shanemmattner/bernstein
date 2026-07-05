@@ -118,6 +118,23 @@ _AUTH_ERROR_PATTERNS: tuple[str, ...] = (
     "PermissionDeniedError",
 )
 
+# Text patterns that indicate the OpenAI Agents SDK's turn cap fired
+# (``agents.exceptions.MaxTurnsExceeded``). This is an unambiguous, fatal,
+# deterministic signal - the runner has already logged the exception and
+# exited - so it must never be treated as "died without output" (which
+# defers behind the double-fork liveness-signal grace window, see
+# ``_probe_liveness_signals`` in agent_lifecycle.py). Root-cause fix for the
+# bug where a task stayed "claimed" for the full 30-minute wall-clock
+# timeout after its agent died with MaxTurnsExceeded: the failure was never
+# classified, so it fell through to the generic no-signal path instead of
+# failing/retrying immediately.
+_MAX_TURNS_PATTERNS: tuple[str, ...] = (
+    "MaxTurnsExceeded",
+    "max turns exceeded",
+    "max_turns exceeded",
+    "Max turns (",  # runner's own log line: "Max turns (30) exceeded"
+)
+
 # Text patterns that indicate a context-overflow / prompt-too-long (413) error.
 #
 # "413" and "context window" are risky bare/generic tokens (see
@@ -495,6 +512,17 @@ class RateLimitTracker:
         """
         return self._scan_log_for_patterns(log_path, _AUTH_ERROR_PATTERNS)
 
+    def scan_log_for_max_turns(self, log_path: Path) -> bool:
+        """Scan the tail of *log_path* for an SDK ``MaxTurnsExceeded`` cap hit.
+
+        Args:
+            log_path: Path to the agent's subprocess log file.
+
+        Returns:
+            True if a max-turns-cap indicator was found, False otherwise.
+        """
+        return self._scan_log_for_patterns(log_path, _MAX_TURNS_PATTERNS)
+
     def scan_log_for_context_overflow(self, log_path: Path) -> bool:
         """Scan the tail of *log_path* for context-overflow / 413 patterns.
 
@@ -512,21 +540,30 @@ class RateLimitTracker:
     def detect_failure_type(self, log_path: Path) -> str | None:
         """Scan an agent log and return the detected failure type.
 
-        Checks for rate limits first, then context overflow, then timeouts,
-        then auth errors, then general API errors.
+        Checks for rate limits first, then context overflow, then the SDK
+        max-turns cap, then timeouts, then auth errors, then general API
+        errors.
 
         Args:
             log_path: Path to the agent's subprocess log file.
 
         Returns:
-            One of ``"rate_limit"``, ``"context_overflow"``, ``"timeout"``,
-            ``"auth_error"``, ``"api_error"``, or ``None`` if no failure
-            pattern was detected.
+            One of ``"rate_limit"``, ``"context_overflow"``, ``"max_turns"``,
+            ``"timeout"``, ``"auth_error"``, ``"api_error"``, or ``None`` if
+            no failure pattern was detected.
         """
         if self.scan_log_for_429(log_path):
             return "rate_limit"
         if self.scan_log_for_context_overflow(log_path):
             return "context_overflow"
+        # Checked before the generic timeout/api_error patterns: a
+        # MaxTurnsExceeded death is unambiguous (the SDK exception was
+        # caught and logged by the runner before it exited) and must never
+        # be reclassified as a vaguer "timeout"/"api_error" - both of those
+        # would still resolve to a fail/retry via the fallthrough below, but
+        # with a less accurate reason string.
+        if self.scan_log_for_max_turns(log_path):
+            return "max_turns"
         if self.scan_log_for_timeout(log_path):
             return "timeout"
         if self.scan_log_for_auth_error(log_path):

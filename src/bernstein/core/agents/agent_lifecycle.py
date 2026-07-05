@@ -968,6 +968,30 @@ def _read_runner_cost_usd(
     return price_result.cost_usd, total_in, total_out
 
 
+
+# Failure types detected via log-pattern scanning that are unambiguous,
+# fatal, and MUST fail/retry the task immediately rather than falling
+# through to the generic "died without output" path (which defers behind
+# the double-fork liveness-signal grace window in
+# ``_probe_liveness_signals`` - correct for a process that genuinely might
+# still be alive under an untracked re-exec, but wrong here because the
+# runner already logged an unambiguous fatal exception before it exited).
+#
+# Root-cause fix (task-claimed-stuck bug, 2026-07-05): a MaxTurnsExceeded
+# death was not classified as ANY of these types before, so it fell all the
+# way through ``detect_failure_type`` -> ``_handle_orphan_no_signals`` ->
+# the liveness-deferral / clean-exit branches, and (depending on timing)
+# could sit "claimed" far longer than necessary before ``retry_or_fail_task``
+# ever ran - up to the orchestrator's 30-minute wall-clock reap ceiling in
+# the worst case. Generalized to the other deterministic-fatal log signals
+# (timeout, auth_error, api_error) per the same reasoning - previously only
+# "rate_limit" and "context_overflow" were actually handled here; the other
+# three were detected by ``detect_failure_type`` but silently fell through
+# to ``return False`` below, losing both the fast-fail and the diagnostic
+# reason string.
+_FAST_FAIL_LOG_FAILURE_TYPES: frozenset[str] = frozenset({"max_turns", "timeout", "auth_error", "api_error"})
+
+
 def _handle_failure_detection(
     orch: Any,
     task: Task,
@@ -977,7 +1001,11 @@ def _handle_failure_detection(
     start_ts: float,
     tasks_snapshot: dict[str, list[Task]],
 ) -> bool:
-    """Detect rate-limit/context-overflow failures and handle them. Returns True if handled."""
+    """Detect fatal failure signatures in the agent log and handle them.
+
+    Returns True if handled (task already failed/retried/compacted - caller
+    must not fall through to the generic orphan-no-signals path).
+    """
     _rl_tracker = getattr(orch, "_rate_limit_tracker", None)
     if _rl_tracker is None or not session.provider:
         return False
@@ -1031,6 +1059,34 @@ def _handle_failure_detection(
         )
         error_type = "context_overflow_compacted" if _compacted else "context_overflow_compact_failed"
         emit_orphan_metrics(orch._workdir, task_id, session, start_ts, success=False, error_type=error_type)
+        orch._record_provider_health(session, success=False)
+        return True
+
+    if _failure_type in _FAST_FAIL_LOG_FAILURE_TYPES:
+        reason = (
+            f"Agent {session.id} died; {_failure_type} detected in agent log "
+            f"(exit_code={session.exit_code!r})"
+        )
+        try:
+            retry_or_fail_task(
+                task_id,
+                reason,
+                client=orch._client,
+                server_url=base,
+                max_task_retries=orch._config.max_task_retries,
+                retried_task_ids=orch._retried_task_ids,
+                tasks_snapshot=tasks_snapshot,
+                workdir=getattr(orch, "_workdir", None),
+                **_retry_escalation_context(orch),
+            )
+            logger.warning(
+                "Task '%s' failed/retried fast (log-detected fatal error): %s",
+                task.title,
+                reason,
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Failed to retry/fail task %s after %s detection: %s", task_id, _failure_type, exc)
+        emit_orphan_metrics(orch._workdir, task_id, session, start_ts, success=False, error_type=_failure_type)
         orch._record_provider_health(session, success=False)
         return True
 
