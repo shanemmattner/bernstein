@@ -166,10 +166,14 @@ __all__ = [
 class AnalysisEngine:
     """Combines MetricsAggregator + OpportunityDetector into a single analysis pass."""
 
-    def __init__(self, collector: MetricsCollector) -> None:
+    def __init__(
+        self,
+        collector: MetricsCollector,
+        failure_analyzer: FailureAnalyzer | None = None,
+    ) -> None:
         self.collector = collector
         self._aggregator = MetricsAggregator(collector)
-        self._detector = OpportunityDetector(collector)
+        self._detector = OpportunityDetector(collector, failure_analyzer=failure_analyzer)
         self._trends: list[TrendAnalysis] = []
         self._anomalies: list[AnomalyDetection] = []
         self._opportunities: list[ImprovementOpportunity] = []
@@ -247,7 +251,8 @@ class EvolutionCoordinator:
         self.state_dir = state_dir
         self.collector = collector or FileMetricsCollector(state_dir)
         self.executor = executor or FileUpgradeExecutor(state_dir)
-        self.analysis_engine = AnalysisEngine(self.collector)
+        self._failure_analyzer = FailureAnalyzer(state_dir)
+        self.analysis_engine = AnalysisEngine(self.collector, failure_analyzer=self._failure_analyzer)
         self.analysis_interval_minutes = analysis_interval_minutes
 
         self._last_analysis: float = 0
@@ -408,6 +413,10 @@ class EvolutionCoordinator:
         provider: str | None = None,
         tokens_prompt: int = 0,
         tokens_completion: int = 0,
+        files_modified: int = 0,
+        lines_added: int = 0,
+        lines_deleted: int = 0,
+        failure_reason: str = "janitor_failure",
     ) -> None:
         """Record metrics for a completed task.
 
@@ -426,6 +435,11 @@ class EvolutionCoordinator:
             provider: Provider used, if known.
             tokens_prompt: Prompt tokens consumed, if known.
             tokens_completion: Completion tokens consumed, if known.
+            files_modified: Number of files the agent modified.
+            lines_added: Lines added across all modified files.
+            lines_deleted: Lines deleted across all modified files.
+            failure_reason: Short error category for failed tasks, used by
+                the FailureAnalyzer to detect recurring patterns.
         """
         metrics = TaskMetrics(
             timestamp=time.time(),
@@ -438,8 +452,19 @@ class EvolutionCoordinator:
             janitor_passed=janitor_passed,
             tokens_prompt=tokens_prompt,
             tokens_completion=tokens_completion,
+            files_modified=files_modified,
+            lines_added=lines_added,
+            lines_deleted=lines_deleted,
         )
         self.collector.record_task_metrics(metrics)
+
+        if not janitor_passed:
+            self._failure_analyzer.record_failure(
+                task_id=task.id,
+                role=task.role,
+                model=model,
+                error_type=failure_reason,
+            )
 
     def record_agent_lifetime(
         self,
