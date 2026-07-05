@@ -14,11 +14,14 @@ Usage inside ``claim_and_spawn_batches``::
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
 
 from bernstein.core.models import ConvergenceGuardConfig
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["ConvergenceGuard", "ConvergenceStatus"]
 
@@ -208,7 +211,8 @@ class ConvergenceGuard:
     def current_error_rate(self, now: float | None = None) -> float:
         """Return failure rate (failures / total) over the configured window.
 
-        Returns -1.0 when there are no samples (cannot compute rate).
+        Returns -1.0 when there are fewer than 5 samples (cannot compute a
+        statistically meaningful rate).
 
         Args:
             now: Epoch timestamp. Defaults to ``time.time()``.
@@ -219,7 +223,10 @@ class ConvergenceGuard:
         self._prune(self._success_timestamps, self._cfg.error_rate_window_seconds, now=now)
         self._prune(self._failure_timestamps, self._cfg.error_rate_window_seconds, now=now)
         total = len(self._success_timestamps) + len(self._failure_timestamps)
-        if total == 0:
+        if total < 5:
+            logger.info(
+                "convergence guard: insufficient samples (%d < 5), skipping error rate check", total
+            )
             return -1.0
         return len(self._failure_timestamps) / total
 

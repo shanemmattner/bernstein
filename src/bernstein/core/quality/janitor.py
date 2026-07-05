@@ -83,6 +83,14 @@ _JUDGE_TEMPLATE_PATH = _BUNDLED_TEMPLATES_DIR / "prompts" / "judge.md"
 # guard would hard-reject an already-verified upgrade proposal.
 _NOOP_TASK_TYPES = frozenset({TaskType.RESEARCH, TaskType.UPGRADE_PROPOSAL})
 
+# Roles that legitimately produce no repo diff (they coordinate, review, or
+# analyze rather than write code) -- see role list in _NOOP_TASK_TYPES above
+# for the task_type analogue. Exempting these roles from the empty-diff guard
+# below prevents a false 100% error rate from crash-looping the convergence
+# guard when a manager/reviewer/qa/architect/vp/visionary/analyst task
+# completes with zero attributable files by design.
+_NOOP_ROLES = frozenset({"manager", "reviewer", "qa", "architect", "vp", "visionary", "analyst"})
+
 _ATTRIBUTION_MAX_COMMITS = 50
 
 # Completion-signal types that constitute real evidence a task did work
@@ -555,7 +563,17 @@ async def run_janitor(
                 attributed_files,
                 attribution_reason,
             )
-            if not attributed_files and task.task_type not in _NOOP_TASK_TYPES:
+            if getattr(task, "role", "") in _NOOP_ROLES:
+                logger.info(
+                    "janitor attribution: skipping empty-diff guard for role=%s task=%s (role in _NOOP_ROLES)",
+                    task.role,
+                    task.id,
+                )
+            if (
+                not attributed_files
+                and task.task_type not in _NOOP_TASK_TYPES
+                and getattr(task, "role", "") not in _NOOP_ROLES
+            ):
                 # An empty attributable diff normally means a 0-file
                 # rubber-stamp or a crash-recovery orphan auto-completion and
                 # must be rejected. BUT a task can legitimately land real work
