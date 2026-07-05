@@ -22,7 +22,11 @@ from bernstein.cli.visual_theme import PALETTE, role_color, sample_gradient
 
 logger = logging.getLogger(__name__)
 
-SERVER_URL = "http://127.0.0.1:8052"
+# Resolved from BERNSTEIN_SERVER_URL (set by the orchestrator's spawner
+# subprocess) so the dashboard polls the actual --auto-port-resolved
+# server instead of the historical hardcoded default.
+SERVER_URL = os.environ.get("BERNSTEIN_SERVER_URL", "http://127.0.0.1:8052")
+logger.info("dashboard_polling SERVER_URL resolved to %s", SERVER_URL)
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 # -- Data fetching (sync -- called via run_worker in a thread) -----

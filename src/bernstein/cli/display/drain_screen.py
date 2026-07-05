@@ -8,6 +8,8 @@ final summary report once the drain completes.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -28,10 +30,18 @@ if TYPE_CHECKING:
     from textual.app import ComposeResult
     from textual.events import Key
 
+logger = logging.getLogger(__name__)
+
 # Total number of drain phases (freeze, signal, wait, commit, merge, cleanup).
 _TOTAL_PHASES = 6
 
-SERVER_URL = "http://127.0.0.1:8052"
+# Resolved from BERNSTEIN_SERVER_URL (set by the orchestrator's spawner
+# subprocess, see cli/helpers.py) so this module-level default agrees with
+# the actual --auto-port-resolved port instead of hardcoding 8052. Callers
+# that know the dashboard's own server_url should still pass it explicitly
+# to DrainScreen(...) -- this is only the last-resort fallback.
+SERVER_URL = os.environ.get("BERNSTEIN_SERVER_URL", "http://127.0.0.1:8052")
+logger.info("drain_screen default SERVER_URL resolved to %s", SERVER_URL)
 
 
 class DrainScreen(Screen[DrainReport | None]):

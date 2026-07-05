@@ -20,13 +20,53 @@ Usage::
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
+
+#: Historical default task-server port, kept as a fallback when
+#: ``BERNSTEIN_SERVER_URL`` is unset or unparseable.
+DEFAULT_TASK_SERVER_PORT = 8052
+
+
+def _resolved_task_server_port() -> int:
+    """Best-effort TCP port implied by ``BERNSTEIN_SERVER_URL``.
+
+    Mirrors ``cli/helpers.py::_server_port_from_env``: under ``--auto-port``
+    the orchestrator binds a non-default port and threads it through this
+    env var, so the sandbox boundary must allow the *actual* port, not just
+    the historical default of 8052.
+    """
+    server_url = os.environ.get("BERNSTEIN_SERVER_URL")
+    if not server_url:
+        return DEFAULT_TASK_SERVER_PORT
+    try:
+        parsed = urlsplit(server_url)
+        if parsed.port:
+            return parsed.port
+    except ValueError:
+        pass
+    return DEFAULT_TASK_SERVER_PORT
+
+
+def _default_allowed_ports() -> tuple[int, ...]:
+    """Default ``allowed_ports`` including the runtime-resolved server port."""
+    resolved_port = _resolved_task_server_port()
+    ports = (80, 443, DEFAULT_TASK_SERVER_PORT)
+    if resolved_port not in ports:
+        ports = (*ports, resolved_port)
+    logger.info(
+        "SandboxProfile allowed_ports resolved to %s (BERNSTEIN_SERVER_URL=%s)",
+        ports,
+        os.environ.get("BERNSTEIN_SERVER_URL", "<unset>"),
+    )
+    return ports
 
 
 class ViolationType(StrEnum):
@@ -100,7 +140,7 @@ class BoundaryConfig:
         "/root/*",
         "/var/run/docker.sock",
     )
-    allowed_ports: tuple[int, ...] = (80, 443, 8052)
+    allowed_ports: tuple[int, ...] = field(default_factory=_default_allowed_ports)
     allowed_hosts: tuple[str, ...] = ("127.0.0.1", "localhost")
     max_processes: int = 50
     denied_executables: tuple[str, ...] = (

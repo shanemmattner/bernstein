@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
@@ -172,11 +173,26 @@ def _exclude_injected_paths(workdir: Path, relative_paths: list[str]) -> None:
     )
 
 
+def _resolve_server_url(server_url: str | None = None) -> str:
+    """Resolve the task server's base URL for skill-template completion commands.
+
+    Priority: explicit *server_url* argument > ``BERNSTEIN_SERVER_URL`` env
+    var (set by the orchestrator's spawner subprocess) > the historical
+    default port 8052. Mirrors ``spawn_prompt._resolve_server_url`` so
+    injected skills and rendered prompts agree on the completion endpoint
+    even when ``--auto-port`` picks a non-default port.
+    """
+    if server_url:
+        return server_url
+    return os.environ.get("BERNSTEIN_SERVER_URL", "http://127.0.0.1:8052")
+
+
 def render_skill_template(
     content: str,
     *,
     session_id: str = "",
     tasks: list[Task] | None = None,
+    server_url: str | None = None,
 ) -> str:
     """Render a skill template by substituting ``{{PLACEHOLDER}}`` tokens.
 
@@ -190,18 +206,23 @@ def render_skill_template(
         content: Raw skill template content.
         session_id: Agent session identifier.
         tasks: Tasks assigned to this agent.  Used to generate completion commands.
+        server_url: Resolved task-server base URL. Falls back to
+            ``BERNSTEIN_SERVER_URL`` env var, then ``http://127.0.0.1:8052``
+            when not supplied -- see :func:`_resolve_server_url`.
 
     Returns:
         Rendered skill content with placeholders substituted.
     """
     task_list = tasks or []
+    resolved_url = _resolve_server_url(server_url)
+    _logger.info("Skill completion commands using server_url=%s", resolved_url)
 
     # Build per-task completion curl commands
     complete_cmds_parts: list[str] = []
     for task in task_list:
         cmd = (
             "```bash\n"
-            f"curl -s --retry 3 -X POST http://127.0.0.1:8052/tasks/{task.id}/complete \\\n"
+            f"curl -s --retry 3 -X POST {resolved_url}/tasks/{task.id}/complete \\\n"
             '  -H "Content-Type: application/json" \\\n'
             f'  -d \'{{"result_summary": "Completed: {task.title}"}}\'\n'
             "```"
@@ -228,6 +249,7 @@ def inject_skills(
     tasks: list[Task],
     session_id: str,
     templates_dir: Path,
+    server_url: str | None = None,
 ) -> None:
     """Write role-specific Claude Code skills into the worktree.
 
@@ -244,6 +266,11 @@ def inject_skills(
         session_id: Agent session identifier, embedded in signal-check paths.
         templates_dir: Path to ``templates/roles/`` directory.  Skills are
             resolved from the sibling ``../skills/`` directory.
+        server_url: Resolved task-server base URL threaded down from the
+            orchestrator/spawner (e.g. from ``AgentSpawner``, which knows the
+            actual ``--auto-port``-resolved port). Callers that don't yet
+            thread this through fall back to the ``BERNSTEIN_SERVER_URL``
+            env var via :func:`_resolve_server_url`.
     """
     skills_source_dir = templates_dir.parent / "skills"
     if not skills_source_dir.is_dir():
@@ -292,7 +319,7 @@ def inject_skills(
             source_name="templates/skills",
         )
 
-        rendered = render_skill_template(sanitized, session_id=session_id, tasks=tasks)
+        rendered = render_skill_template(sanitized, session_id=session_id, tasks=tasks, server_url=server_url)
 
         dest_path = skills_dest_dir / template_name
         try:
