@@ -187,6 +187,21 @@ TASK_TRANSITIONS: dict[tuple[TaskStatus, TaskStatus], Callable[[Task], bool]] = 
     (TaskStatus.WAITING_FOR_SUBTASKS, TaskStatus.FAILED): _always,  # batch stage failure
     # Retry from failed
     (TaskStatus.FAILED, TaskStatus.OPEN): _always,
+    # Retry-lineage success propagation (bug fix, 2026-07): ``retry_or_fail_task``
+    # (bernstein.core.tasks.task_lifecycle) recreates a retry attempt under a
+    # BRAND NEW task id and marks the original task_id FAILED ("Retried: ...")
+    # as a superseded placeholder - by design, since the new id is what
+    # actually gets claimed/worked. But callers that watch a SINGLE task_id
+    # end-to-end (e.g. a phased-workflow driver's poll loop) never learn the
+    # new id exists, so if the retry eventually succeeds, the original id they
+    # are watching is stuck at terminal FAILED forever even though the work it
+    # represents did complete. ``_propagate_retry_lineage_success`` (task_lifecycle.py)
+    # closes every FAILED predecessor in the same retry lineage once the
+    # lineage's current attempt reaches CLOSED, so any task_id in the chain
+    # reads as terminal-success. This edge is additive: nothing else in the
+    # codebase currently attempts a FAILED->CLOSED transition, so allowing it
+    # cannot change the behavior of any existing (non-retry-propagation) call.
+    (TaskStatus.FAILED, TaskStatus.CLOSED): _always,
     # Verification gate (orchestrator closes after janitor + merge)
     (TaskStatus.DONE, TaskStatus.CLOSED): _always,
     (TaskStatus.DONE, TaskStatus.FAILED): _always,
