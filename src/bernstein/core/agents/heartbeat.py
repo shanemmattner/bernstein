@@ -85,7 +85,7 @@ class HeartbeatMonitor:
         """Check all session IDs in order."""
         return [self.check(session_id) for session_id in session_ids]
 
-    def inject_heartbeat_instructions(self, session_id: str) -> str:
+    def inject_heartbeat_instructions(self, session_id: str, *, max_lifetime_s: int = 7200) -> str:
         """Return a shell snippet that writes heartbeats in the background.
 
         Defect-10 fix (leaked heartbeat shell loop, 2026-07-02/03 Claude leg):
@@ -97,6 +97,30 @@ class HeartbeatMonitor:
         own PID to a run-scoped pidfile so :meth:`reap_heartbeat_loop` can
         kill it directly as a belt-and-braces backstop (e.g. if the run
         crashes before it can write the STOP marker).
+
+        Defect-11 fix (2026-07-05, runaway CPU-spin incident): the previous
+        inner tick loop used a mutable shell variable (``_t=0; while [ "$_t"
+        -lt 15 ]; do ...; _t=$((_t+1)); done``) to sleep in 1s ticks. Two
+        live host processes (implement-7eef727c, implement-44411573) were
+        found spinning at ~70% CPU for hours with a *corrupted* copy of this
+        loop -- the comparison had degraded to ``while [ "" -lt 15 ]``
+        (``_t`` empty), which is a shell syntax error that evaluates false
+        immediately, so the loop body never called ``sleep`` and the outer
+        loop spun with zero backoff. The exact corruption path wasn't
+        reproducible from this module's tracked history (the string emitted
+        here has always had ``"$_t"`` quoted correctly), which points at the
+        executing agent transcribing/retyping the multi-statement command
+        rather than running the emitted string byte-for-byte. Rather than
+        rely on every future agent (and every future model) reproducing a
+        stateful counter variable correctly, the tick loop below is now a
+        ``for`` loop over a fixed literal sequence -- there is no mutable
+        loop variable for a retype/corruption to break, so the degenerate
+        failure mode (comparison silently false, sleep skipped, 100% CPU
+        spin) is structurally impossible regardless of how the command gets
+        re-entered. As defense in depth, the outer loop also carries a hard
+        wall-clock cap (`max_lifetime_s`, default 2h) so that even a STOP
+        marker that never arrives (e.g. the orchestrator itself crashes)
+        cannot keep this loop alive indefinitely.
         """
         heartbeat_dir = self._workdir / ".sdd" / "runtime" / "heartbeats"
         heartbeat_path = heartbeat_dir / f"{session_id}.json"
@@ -106,11 +130,13 @@ class HeartbeatMonitor:
         escaped_pid = str(pid_path)
         escaped_stop = str(stop_path)
         logger.info(
-            "Heartbeat loop instructions generated for session %s (heartbeat=%s pidfile=%s stopfile=%s)",
+            "Heartbeat loop instructions generated for session %s "
+            "(heartbeat=%s pidfile=%s stopfile=%s max_lifetime_s=%d)",
             session_id,
             escaped_path,
             escaped_pid,
             escaped_stop,
+            max_lifetime_s,
         )
         # NOTE: mkdir/rm must be their own statements (`;`, not `&&`) -- a
         # trailing `&` backgrounds the entire preceding `&&` AND-list, which
@@ -118,18 +144,28 @@ class HeartbeatMonitor:
         # made the pidfile write fail before the directory existed.
         # Sleep in 1s ticks (up to 15) rather than one `sleep 15` so the
         # STOP-marker check has sub-second latency instead of waiting out a
-        # full sleep before noticing the run has ended.
+        # full sleep before noticing the run has ended. The tick loop is a
+        # `for` over a fixed literal sequence (not a `while` on a mutable
+        # counter) so there is no variable state whose corruption can skip
+        # the sleep and spin the loop at 100% CPU -- see Defect-11 above.
+        # The outer loop additionally self-terminates after max_lifetime_s
+        # wall-clock seconds even if the STOP marker never appears.
         return (
             f"# heartbeat cadence: sleep 15s total, polled in 1s ticks for fast STOP response\n"
+            f"# hard cap: self-terminates after {max_lifetime_s}s even without a STOP marker\n"
             f"mkdir -p '{heartbeat_dir}'; rm -f '{escaped_stop}'; "
-            f"(while [ ! -f '{escaped_stop}' ]; do "
+            f"(_hb_start=$(date +%s); "
+            f"while [ ! -f '{escaped_stop}' ] && "
+            f"[ $(( $(date +%s) - _hb_start )) -lt {max_lifetime_s} ]; do "
             f'printf \'{{"timestamp":%s,'
             f'"phase":"implementing",'
             f'"progress_pct":0,'
             f'"current_file":"",'
             f'"message":"working"}}\' '
             f"\"$(date +%s)\" > '{escaped_path}'; "
-            f"_t=0; while [ \"$_t\" -lt 15 ] && [ ! -f '{escaped_stop}' ]; do sleep 1; _t=$((_t+1)); done; "
+            f"for _tick in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do "
+            f"[ -f '{escaped_stop}' ] && break; sleep 1; "
+            f"done; "
             f"done; rm -f '{escaped_pid}') >/dev/null 2>&1 & "
             f"echo $! > '{escaped_pid}'"
         )
