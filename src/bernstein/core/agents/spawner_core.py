@@ -781,6 +781,7 @@ def _render_prompt(
     task_graph: TaskGraph | None = None,
     token_budget: int = 0,
     meta_messages: list[str] | None = None,
+    max_turns: int | None = None,
 ) -> str:
     """Build the full agent prompt from role template + tasks + context.
 
@@ -805,6 +806,17 @@ def _render_prompt(
             team-awareness section. Empty string means no section is added.
         task_graph: Optional task graph for injecting typed-edge predecessor
             context (INFORMS / TRANSFORMS outputs).
+        max_turns: Optional best-effort resolution of the agent's tool-use
+            turn cap, known at the spawn call site (see
+            ``AgentSpawner._spawn_agent``'s resolution logic just before
+            this function is called). When present, renders a static
+            "## Turn budget" section so the model self-polices instead of
+            exploring until ``MaxTurnsExceeded`` fires with zero output
+            (see work/bernstein/m27-nudge-plan.md, Approach C MINIMAL).
+            ``None`` means the caller could not resolve a value at
+            prompt-build time (e.g. SDK default applies, or the resolved
+            adapter doesn't use a turn-capped runner) - the section is
+            skipped in that case, not rendered with a placeholder.
 
     Returns:
         Complete prompt string ready for the CLI adapter.
@@ -1000,6 +1012,61 @@ def _render_prompt(
     if meta_messages:
         nudges_block = "\n## Operational nudges\n" + "\n".join(f"- {m}" for m in meta_messages) + "\n"
         sections.append(nudges_block)
+
+    # Turn-budget nudge (work/bernstein/m27-nudge-plan.md, Approach C
+    # MINIMAL): models spawned in tool-use loops (observed worst on MiniMax
+    # M2.7-highspeed) burn their whole turn cap reading/re-verifying and
+    # never write output, then hit MaxTurnsExceeded with nothing to show.
+    # Since Bernstein has no live mid-run injection channel into the
+    # openai-agents SDK's internal Runner.run_sync loop (see the plan doc's
+    # feasibility analysis), the only buildable fix today is a STATIC
+    # budget baked into the prompt at spawn time from whatever max_turns
+    # value the caller could resolve before this render call. Only render
+    # when a real positive value is known - a placeholder/guessed value
+    # would be actively misleading.
+    if max_turns is not None and max_turns > 0:
+        halfway_turn = max(1, max_turns // 2)
+        # near_end heuristic: 3 turns before the cap, but never below/at
+        # halfway_turn (tiny caps like max_turns=4 would otherwise put
+        # near_end before halfway) and never past max_turns itself.
+        near_end_turn = max(halfway_turn + 1, min(max_turns, max_turns - 3))
+        turn_budget_block = (
+            "\n## Turn budget\n"
+            f"You have a hard budget of {max_turns} tool-use turns for this task.\n\n"
+            f"- By turn {halfway_turn} (roughly halfway): if the core task is already "
+            "done, STOP - write your final summary now. Do not spend remaining turns "
+            "re-reading files you've already read or re-verifying work that already "
+            "passed.\n"
+            f"- By turn {near_end_turn} (near your limit): if you have not yet written "
+            "any code/output, you are out of time for further exploration - write "
+            "SOMETHING now, even a partial/best-effort change, rather than continuing "
+            "to read.\n"
+            "- On your FINAL turn: your last message must be plain text summarizing "
+            "what you accomplished, what remains unfinished, and any risks. Do not "
+            "attempt further tool calls.\n\n"
+            "STOP CONDITIONS - if any of these are true, stop immediately and write "
+            "your summary:\n"
+            "- All requested changes are implemented and tests pass\n"
+            "- You have verified your work is correct\n"
+            "- You are re-reading files you already read with no new information to "
+            "gain\n"
+        )
+        sections.append(turn_budget_block)
+        logger.info(
+            "Turn budget nudge injected for session=%s: max_turns=%d halfway=%d near_end=%d",
+            session_id,
+            max_turns,
+            halfway_turn,
+            near_end_turn,
+        )
+    else:
+        logger.info(
+            "Turn budget nudge skipped for session=%s: max_turns not available at "
+            "prompt-build time (resolved value=%r) - agent will not receive a turn-budget "
+            "self-check section",
+            session_id,
+            max_turns,
+        )
 
     # Annotate prompt sections with cache hints so adapters can apply
     # provider-specific caching (e.g. Anthropic's cache_control).
@@ -2809,6 +2876,46 @@ class AgentSpawner:
         # Render prompt (catalog system_prompt replaces role template when matched)
         bulletin_summary = self._bulletin.summary() if self._bulletin is not None else ""
         meta_messages = list(tasks[0].meta_messages)
+
+        # Best-effort max_turns resolution for the turn-budget prompt nudge
+        # (work/bernstein/m27-nudge-plan.md, Approach C MINIMAL). The
+        # AUTHORITATIVE value for openai_agents spawns is resolved later,
+        # inside OpenAIAgentsAdapter._build_manifest() (mcp_config override >
+        # _resolve_max_turns()), which runs after this prompt is already
+        # built - there is no Bernstein-owned hook to inject text into an
+        # already-rendered prompt from there. So we mirror that same
+        # precedence HERE, at prompt-build time, using a plain read (no
+        # mutation of task/adapter state): explicit per-task override first,
+        # then the same env-var/tuning-default resolver the runner itself
+        # uses. This can diverge from the adapter's final value only if a
+        # per-spawn mcp_config override is injected between here and the
+        # adapter call (not done anywhere in this codebase today - see grep
+        # for "mcp_config...max_turns" - so in practice they match for every
+        # current call path).
+        _effective_max_turns = getattr(tasks[0], "max_turns", None)
+        _max_turns_source = "task.max_turns (explicit per-task override)"
+        if _effective_max_turns is None:
+            try:
+                from bernstein.adapters.openai_agents_runner import _resolve_max_turns
+
+                _effective_max_turns = _resolve_max_turns()
+                _max_turns_source = "openai_agents_runner._resolve_max_turns (env BERNSTEIN_MAX_TURNS / tuning.agent.max_turns / SDK default)"
+            except Exception as exc:
+                logger.debug(
+                    "Turn-budget prompt injection: _resolve_max_turns() unavailable for session=%s (%s); "
+                    "prompt will omit the turn-budget section",
+                    session_id,
+                    exc,
+                )
+                _effective_max_turns = None
+                _max_turns_source = "unresolved (import/call failed)"
+        logger.info(
+            "Turn-budget max_turns resolution for session=%s: value=%r source=%s",
+            session_id,
+            _effective_max_turns,
+            _max_turns_source,
+        )
+
         if is_batch_mode:
             # Use the first batch task as the primary task for the /batch prompt.
             # Multi-task batches with mode=batch are unusual but we handle them by
@@ -2831,6 +2938,7 @@ class AgentSpawner:
                 bulletin_summary=bulletin_summary,
                 token_budget=task_token_budget,
                 meta_messages=meta_messages,
+                max_turns=_effective_max_turns,
             )
 
         agent_source = catalog_agent.source if catalog_agent else "built-in"
@@ -3574,6 +3682,30 @@ class AgentSpawner:
         session_id = f"{role}-resume-{uuid.uuid4().hex[:8]}"
 
         meta_messages = ["This is a crash recovery session. Continue from where the previous agent left off."]
+
+        # Same best-effort max_turns resolution as spawn_for_tasks() above
+        # (work/bernstein/m27-nudge-plan.md) - crash-recovery sessions are
+        # exactly the kind of short, tightly-budgeted resume where a model
+        # exploring instead of finishing is most costly.
+        _resume_max_turns = getattr(tasks[0], "max_turns", None)
+        if _resume_max_turns is None:
+            try:
+                from bernstein.adapters.openai_agents_runner import _resolve_max_turns
+
+                _resume_max_turns = _resolve_max_turns()
+            except Exception as exc:
+                logger.debug(
+                    "Turn-budget prompt injection: _resolve_max_turns() unavailable for resume session=%s (%s)",
+                    session_id,
+                    exc,
+                )
+                _resume_max_turns = None
+        logger.info(
+            "Turn-budget max_turns resolution for resume session=%s: value=%r",
+            session_id,
+            _resume_max_turns,
+        )
+
         prompt = _render_prompt(
             tasks,
             self._templates_dir,
@@ -3583,6 +3715,7 @@ class AgentSpawner:
             context_builder=self._context_builder,
             session_id=session_id,
             meta_messages=meta_messages,
+            max_turns=_resume_max_turns,
         )
         # Prepend crash recovery context
         prompt = resume_header + prompt
