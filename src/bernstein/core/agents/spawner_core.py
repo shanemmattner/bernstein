@@ -7,6 +7,7 @@ import concurrent.futures
 import inspect
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -392,7 +393,25 @@ def _render_signal_check(session_id: str) -> str:
     )
 
 
-def _render_auth_section(token_path: Path) -> str:
+def _resolve_server_url(server_url: str | None = None) -> str:
+    """Resolve the task server's base URL for agent-facing prompt text.
+
+    Priority: explicit *server_url* argument (threaded down from
+    ``AgentSpawner``/``Orchestrator``, which know the actual
+    ``--auto-port``-resolved port) > ``BERNSTEIN_SERVER_URL`` env var (set
+    by ``server_launch._start_spawner`` into the orchestrator subprocess
+    env) > the historical default port 8052. Without this, prompts
+    hardcode 8052 even when ``--auto-port`` bound to a different port, so
+    spawned agents POST completions to a dead/unrelated port.
+
+    Mirrors :func:`bernstein.core.agents.spawn_prompt._resolve_server_url`.
+    """
+    if server_url:
+        return server_url
+    return os.environ.get("BERNSTEIN_SERVER_URL", "http://127.0.0.1:8052")
+
+
+def _render_auth_section(token_path: Path, server_url: str | None = None) -> str:
     """Return authentication instructions to inject into every agent's prompt.
 
     The token file path is referenced by path rather than embedding the raw
@@ -406,11 +425,15 @@ def _render_auth_section(token_path: Path) -> str:
 
     Args:
         token_path: Path to the session-scoped JWT token file (mode 0600).
+        server_url: Resolved task-server base URL (see
+            :func:`_resolve_server_url`). Falls back to
+            ``BERNSTEIN_SERVER_URL`` / ``http://127.0.0.1:8052`` when unset.
 
     Returns:
         Markdown block instructing the agent to authenticate all requests.
     """
     absolute = token_path if token_path.is_absolute() else token_path.resolve(strict=False)
+    resolved_url = _resolve_server_url(server_url)
     return (
         "\n## Task Server Authentication\n"
         "Your agent token is stored at this absolute path (do NOT print or "
@@ -452,14 +475,14 @@ def _render_auth_section(token_path: Path) -> str:
         "the command form was correct.\n"
         "Example - creating a subtask (pass the whole line to `run_command` as ONE string):\n"
         "```bash\n"
-        f"curl -sS -w '\\n%{{http_code}}' -X POST http://127.0.0.1:8052/tasks \\\n"
+        f"curl -sS -w '\\n%{{http_code}}' -X POST {resolved_url}/tasks \\\n"
         f'  -H "Authorization: Bearer $(cat {absolute})" \\\n'
         '  -H "Content-Type: application/json" \\\n'
         '  -d \'{"title": "...", "role": "backend", "description": "..."}\'\n'
         "```\n"
         "Example - marking a task complete (pass the whole line to `run_command` as ONE string):\n"
         "```bash\n"
-        f"curl -sS -w '\\n%{{http_code}}' -X POST http://127.0.0.1:8052/tasks/<TASK_ID>/complete \\\n"
+        f"curl -sS -w '\\n%{{http_code}}' -X POST {resolved_url}/tasks/<TASK_ID>/complete \\\n"
         f'  -H "Authorization: Bearer $(cat {absolute})" \\\n'
         '  -H "Content-Type: application/json" \\\n'
         '  -d \'{"result_summary": "Done"}\'\n'
@@ -662,7 +685,7 @@ def _render_predecessor_context(tasks: list[Task], task_graph: TaskGraph | None)
     )
 
 
-def _render_batch_prompt(task: Task) -> str:
+def _render_batch_prompt(task: Task, server_url: str | None = None) -> str:
     """Build a /batch prompt for homogeneous large-scale refactors.
 
     When a task declares ``execution_mode: batch``, Bernstein spawns a single
@@ -677,10 +700,13 @@ def _render_batch_prompt(task: Task) -> str:
 
     Args:
         task: The batch-mode task to delegate.
+        server_url: Resolved task-server base URL (see
+            :func:`_resolve_server_url`).
 
     Returns:
         Prompt string starting with ``/batch`` that triggers the batch skill.
     """
+    resolved_url = _resolve_server_url(server_url)
     lines: list[str] = [f"/batch {task.description}"]
     if task.owned_files:
         lines.append(f"\nAffected paths: {', '.join(task.owned_files)}")
@@ -688,7 +714,7 @@ def _render_batch_prompt(task: Task) -> str:
         (
             f"\nTask ID for completion reporting: {task.id}",
             "\nAfter all batch units are complete, run:\n"
-            f"curl -sS -X POST http://127.0.0.1:8052/tasks/{task.id}/complete "
+            f"curl -sS -X POST {resolved_url}/tasks/{task.id}/complete "
             f'-H "Content-Type: application/json" '
             f'-d \'{{"result_summary": "Batch complete: {task.title}"}}\'',
         )
@@ -782,6 +808,7 @@ def _render_prompt(
     token_budget: int = 0,
     meta_messages: list[str] | None = None,
     max_turns: int | None = None,
+    server_url: str | None = None,
 ) -> str:
     """Build the full agent prompt from role template + tasks + context.
 
@@ -817,6 +844,8 @@ def _render_prompt(
             prompt-build time (e.g. SDK default applies, or the resolved
             adapter doesn't use a turn-capped runner) - the section is
             skipped in that case, not rendered with a placeholder.
+        server_url: Resolved task-server base URL (see
+            :func:`_resolve_server_url`).
 
     Returns:
         Complete prompt string ready for the CLI adapter.
@@ -843,9 +872,11 @@ def _render_prompt(
     # agents must retry on transient connection errors (--retry-connrefused).
     # Do NOT use --retry-all-errors: it retries 4xx (e.g. 409 Conflict),
     # causing infinite loops when task state has changed.
+    resolved_url = _resolve_server_url(server_url)
+    logger.info("Completion URL for task(s) %s: %s", [t.id for t in tasks], resolved_url)
     completion_cmds = "\n".join(
         f"curl -s -w '\\n%{{http_code}}' --retry 3 --retry-delay 2 --retry-connrefused "
-        f"-X POST http://127.0.0.1:8052/tasks/{t.id}/complete "
+        f"-X POST {resolved_url}/tasks/{t.id}/complete "
         f'-H "Content-Type: application/json" '
         f'-d \'{{"result_summary": "Completed: {t.title}"}}\''
         for t in tasks
@@ -1160,8 +1191,14 @@ class AgentSpawner:
         sandbox_options: dict[str, Any] | None = None,
         sandbox_server_port: int | None = None,
         default_model: str | None = None,
+        server_url: str | None = None,
     ) -> None:
         self._enable_caching = enable_caching
+        # Task-server base URL agents POST completions/subtasks to. Resolved
+        # once here (explicit arg > BERNSTEIN_SERVER_URL env > default 8052)
+        # so it reflects the orchestrator's actual --auto-port-resolved port
+        # instead of every prompt-building call site hardcoding 8052.
+        self._server_url = _resolve_server_url(server_url)
         # Run-level model (e.g. from ``bernstein run --model``), threaded in by
         # the orchestrator from the CLI flag / seed config. Used to coerce
         # Claude tier names (opus/sonnet/haiku) emitted by the heuristic
@@ -1340,8 +1377,6 @@ class AgentSpawner:
         Returns:
             Absolute path to the written token file.
         """
-        import os
-
         _, raw_token = self._identity_store.create_identity(
             session_id,
             role,
@@ -2920,7 +2955,7 @@ class AgentSpawner:
             # Use the first batch task as the primary task for the /batch prompt.
             # Multi-task batches with mode=batch are unusual but we handle them by
             # using the first task's goal as the primary directive.
-            prompt = _render_batch_prompt(tasks[0])
+            prompt = _render_batch_prompt(tasks[0], server_url=self._server_url)
             logger.info(
                 "Batch execution mode: spawning single agent with /batch prompt for task %s",
                 tasks[0].id,
@@ -2937,6 +2972,7 @@ class AgentSpawner:
                 session_id=session_id,
                 bulletin_summary=bulletin_summary,
                 token_budget=task_token_budget,
+                server_url=self._server_url,
                 meta_messages=meta_messages,
                 max_turns=_effective_max_turns,
             )
@@ -3026,7 +3062,7 @@ class AgentSpawner:
         try:
             task_ids_for_scope = [t.id for t in tasks]
             _token_path = self._issue_agent_token(session_id, role, task_ids_for_scope)
-            prompt = prompt + _render_auth_section(_token_path)
+            prompt = prompt + _render_auth_section(_token_path, server_url=self._server_url)
         except Exception as _token_exc:
             # Only the session_id and exception are logged.
             # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
@@ -3716,6 +3752,7 @@ class AgentSpawner:
             session_id=session_id,
             meta_messages=meta_messages,
             max_turns=_resume_max_turns,
+            server_url=self._server_url,
         )
         # Prepend crash recovery context
         prompt = resume_header + prompt
