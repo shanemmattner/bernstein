@@ -719,6 +719,90 @@ def _get_lesson_context(role: str, tasks: list[Task], workdir: Path) -> str:
     return lesson_context
 
 
+def _resolve_server_url(server_url: str | None = None) -> str:
+    """Resolve the task server's base URL for agent-facing prompt text.
+
+    Priority: explicit *server_url* argument > ``BERNSTEIN_SERVER_URL`` env
+    var (set by the orchestrator's spawner subprocess, see
+    ``server_launch._start_spawner``) > the historical default port 8052.
+    Without this, prompts hardcode 8052 even when ``--auto-port`` bound the
+    orchestrator to a different port, so spawned agents POST completions to
+    a dead/unrelated port.
+    """
+    if server_url:
+        return server_url
+    return os.environ.get("BERNSTEIN_SERVER_URL", "http://127.0.0.1:8052")
+
+
+def _legacy_completion_instructions(tasks: list[Task], server_url: str | None = None) -> str:
+    """Fallback completion instructions when the contract include is absent.
+
+    Mirrors the pre-contract prose: concrete curl commands with
+    --retry-connrefused (not --retry-all-errors) so curl only retries
+    transient connection failures, NOT 4xx errors like 409 Conflict.
+    """
+    resolved_url = _resolve_server_url(server_url)
+    completion_cmds = "\n".join(
+        f"curl -s -w '\\n%{{http_code}}' --retry 3 --retry-delay 2 --retry-connrefused "
+        f"-X POST {resolved_url}/tasks/{t.id}/complete "
+        f'-H "Content-Type: application/json" '
+        f'-d \'{{"result_summary": "Completed: {t.title}"}}\''
+        for t in tasks
+    )
+    return (
+        f"Complete these tasks. When ALL are done, mark each complete on the task server:\n\n"
+        f"```bash\n{completion_cmds}\n```\n\n"
+        f"**Important:** Only retry on connection refused / network errors. "
+        f"If the server returns HTTP 409 or any other 4xx error, do NOT retry. "
+        f"The task state has changed and retrying will not help. Just exit.\n\n"
+        f"Then exit."
+    )
+
+
+def _render_completion_instructions(tasks: list[Task], server_url: str | None = None) -> str:
+    """Build the terminal-outcome instruction block for the worker prompt.
+
+    Renders the shared ``templates/roles/_includes/completion_contract.md``
+    partial (#2244) so the runtime prompt and the role task templates emit
+    the same schema-enforced completion/refusal instructions. Falls back
+    to the legacy prose-summary instructions when the include is missing
+    (e.g. a stripped install), so spawns never lose the done signal.
+
+    Args:
+        tasks: Batch of tasks the agent must report a terminal outcome for.
+        server_url: Resolved task-server base URL (e.g. from
+            ``Orchestrator``/``AgentSpawner``, which know the actual
+            ``--auto-port``-resolved port). Falls back to
+            ``BERNSTEIN_SERVER_URL`` env var, then ``http://127.0.0.1:8052``
+            when not supplied -- see :func:`_resolve_server_url`.
+    """
+    from bernstein import _BUNDLED_TEMPLATES_DIR
+
+    resolved_url = _resolve_server_url(server_url)
+    logger.info("Completion URL for task(s) %s: %s", [t.id for t in tasks], resolved_url)
+
+    include_path = _BUNDLED_TEMPLATES_DIR / "roles" / "_includes" / "completion_contract.md"
+    try:
+        template = include_path.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("Completion contract include missing at %s; using legacy instructions", include_path)
+        return _legacy_completion_instructions(tasks, server_url=resolved_url)
+
+    ids = [t.id for t in tasks]
+    template = template.replace("{{SERVER_URL}}", resolved_url)
+    if len(ids) == 1:
+        header = "Complete this task. When done, report a terminal outcome for it:\n\n"
+        block = template.replace("{{TASK_ID}}", ids[0])
+    else:
+        header = (
+            "Complete these tasks. When ALL are done, report a terminal outcome "
+            "for each of these task ids (one POST per id): " + ", ".join(ids) + "\n\n"
+        )
+        block = template.replace("{{TASK_ID}}", "<task_id>")
+    return f"{header}{block}\nThen exit."
+
+
+
 def _render_prompt(
     tasks: list[Task],
     templates_dir: Path,
@@ -731,6 +815,8 @@ def _render_prompt(
     task_graph: TaskGraph | None = None,
     meta_messages: list[str] | None = None,
     file_ownership: dict[str, str] | None = None,
+    max_turns: int | None = None,
+    server_url: str | None = None,
 ) -> str:
     """Build the full agent prompt from role template + tasks + context.
 
@@ -756,6 +842,16 @@ def _render_prompt(
         meta_messages: Optional list of operational nudges/hints (T423).
         file_ownership: Optional mapping of filepath -> agent_id for files
             currently being edited by other agents.
+        max_turns: Optional best-effort resolution of the agent's tool-use
+            turn cap, known at the caller's spawn call site. When present,
+            renders a static "## Turn budget" section so the model
+            self-polices instead of exploring until MaxTurnsExceeded fires
+            with zero output (work/bernstein/m27-nudge-plan.md, Approach C
+            MINIMAL). ``None`` means no value was resolvable at
+            prompt-build time - the section is skipped, not rendered with
+            a placeholder.
+        server_url: Resolved task-server base URL threaded down from the
+            orchestrator/spawner. See :func:`_resolve_server_url`.
 
     Returns:
         Complete prompt string ready for the CLI adapter.
@@ -775,24 +871,9 @@ def _render_prompt(
     project_md = workdir / ".sdd" / "project.md"
     project_context = _read_cached(project_md)
 
-    # Completion instructions with concrete curl commands and retry logic.
-    # Use --retry-connrefused (not --retry-all-errors) so curl only retries
-    # transient connection failures, NOT 4xx errors like 409 Conflict.
-    completion_cmds = "\n".join(
-        f"curl -s -w '\\n%{{http_code}}' --retry 3 --retry-delay 2 --retry-connrefused "
-        f"-X POST http://127.0.0.1:8052/tasks/{t.id}/complete "
-        f'-H "Content-Type: application/json" '
-        f'-d \'{{"result_summary": "Completed: {t.title}"}}\''
-        for t in tasks
-    )
-    instructions = (
-        f"Complete these tasks. When ALL are done, mark each complete on the task server:\n\n"
-        f"```bash\n{completion_cmds}\n```\n\n"
-        f"**Important:** Only retry on connection refused / network errors. "
-        f"If the server returns HTTP 409 or any other 4xx error, do NOT retry. "
-        f"The task state has changed and retrying will not help. Just exit.\n\n"
-        f"Then exit."
-    )
+    # Completion-contract instructions shared with templates/roles via the
+    # single _includes/completion_contract.md partial (#2244).
+    instructions = _render_completion_instructions(tasks, server_url=server_url)
 
     # Available roles from templates directory
     available_roles = ""

@@ -5284,6 +5284,23 @@ if __name__ == "__main__":
             ),
         )
 
+        _spawner_role_model_policy = seed.role_model_policy if seed else None
+        _spawner_policy_repr = (
+            json.dumps(_spawner_role_model_policy, default=str) if _spawner_role_model_policy else "<None/empty>"
+        )
+        print(
+            "[SPAWNER-DEBUG] orchestrator __main__: constructing AgentSpawner with "
+            f"role_model_policy={_spawner_policy_repr}, "
+            f"default_model={run_model!r}, adapter={adapter_inst!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Resolved once here (rather than left to each prompt-building call
+        # site to hardcode 8052) so agents spawned with --auto-port bound to
+        # a non-default port still POST completions to the right server.
+        # Mirrors the resolution done later in this function for
+        # ``server_url``/``ClusterConfig`` (env var > actual bound port).
+        _spawner_server_url = os.environ.get("BERNSTEIN_SERVER_URL", f"http://127.0.0.1:{args.port}")
         spawner = AgentSpawner(
             adapter=adapter_inst,
             templates_dir=get_templates_dir(workdir) / "roles",
@@ -5308,6 +5325,7 @@ if __name__ == "__main__":
             sandbox_options={"image": _container_image} if _docker_sandbox_backend is not None else None,
             sandbox_server_port=args.port,
             default_model=run_model,
+            server_url=_spawner_server_url,
         )
         run_config_budget_usd: float | None = None
         dry_run = False
