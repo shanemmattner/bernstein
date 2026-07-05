@@ -811,6 +811,7 @@ def cli(
         goal=goal,
         seed_file=str(seed_path) if seed_path else None,
         port=port,
+        auto_port=True,
         cells=1,
         remote=False,
         cli=cli_override,
