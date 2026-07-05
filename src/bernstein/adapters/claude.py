@@ -411,9 +411,31 @@ class ClaudeCodeAdapter(CLIAdapter):
         """
         model_id = _MODEL_MAP.get(model_config.model, model_config.model)
         effort = getattr(model_config, "effort", "high")
-        base_turns = COST.effort_base_turns.get(effort, 50)
-        scope_multiplier = self._SCOPE_MULTIPLIERS.get(task_scope, 1.5)
-        max_turns = self.BATCH_MAX_TURNS if batch_mode else int(base_turns * scope_multiplier)
+        if explicit_max_turns is not None:
+            if explicit_max_turns <= 0:
+                _logger.warning(
+                    "_build_command: explicit_max_turns=%d is not a positive integer - rejecting "
+                    "rather than emitting an invalid --max-turns flag to the Claude CLI",
+                    explicit_max_turns,
+                )
+                raise ValueError(f"explicit_max_turns must be a positive integer, got {explicit_max_turns}")
+            max_turns = explicit_max_turns
+            _logger.info(
+                "_build_command: max_turns=%d (explicit override; bypassing batch_mode/scope_multiplier computation)",
+                max_turns,
+            )
+        else:
+            base_turns = COST.effort_base_turns.get(effort, 50)
+            scope_multiplier = self._SCOPE_MULTIPLIERS.get(task_scope, 1.5)
+            max_turns = self.BATCH_MAX_TURNS if batch_mode else int(base_turns * scope_multiplier)
+            _logger.info(
+                "_build_command: max_turns=%d (computed: batch_mode=%s effort=%s task_scope=%s scope_multiplier=%s)",
+                max_turns,
+                batch_mode,
+                effort,
+                task_scope,
+                scope_multiplier,
+            )
         claude_effort = ({"max": "max", "high": "high", "medium": "medium", "normal": "medium", "low": "low"}).get(
             effort, "high"
         )

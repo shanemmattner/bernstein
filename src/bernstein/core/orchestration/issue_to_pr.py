@@ -77,7 +77,7 @@ STAGE_PR_REVISED_RE: re.Pattern[str] = re.compile(
 APPROVAL_KEYWORD: str = "[approved]"
 
 
-class Stage(str, Enum):  # noqa: UP042 - explicit str base for label export
+class Stage(str, Enum):
     """Pipeline stages, ordered."""
 
     PLAN = "plan"
@@ -86,7 +86,7 @@ class Stage(str, Enum):  # noqa: UP042 - explicit str base for label export
     PR_REVISE = "pr_revise"
 
 
-class StageOutcome(str, Enum):  # noqa: UP042 - explicit str base for label export
+class StageOutcome(str, Enum):
     """Outcome of running a single stage."""
 
     ADVANCED = "advanced"

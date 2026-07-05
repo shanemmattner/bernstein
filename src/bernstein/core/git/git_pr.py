@@ -195,6 +195,19 @@ def _check_python_syntax(cwd: Path) -> list[str]:
 
     # Get the list of files modified in the staged merge
     names_result = run_git(["diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd, timeout=15)
+    if not names_result.ok:
+        # A failed git invocation (non-zero exit, no exception) must not be
+        # treated as "no staged .py files" -- that would silently skip the
+        # syntax gate and let unverified files through to the merge commit.
+        # Fail closed: report it as a blocking error so the merge is
+        # refused rather than let a mundane git hiccup pass as clean.
+        logger.warning(
+            "Syntax check: STAGED-READ-FAILED cwd=%s returncode=%d stderr=%s -- refusing merge as fail-closed",
+            cwd,
+            names_result.returncode,
+            names_result.stderr.strip(),
+        )
+        return [f"<staged-read-failed>: git diff --cached failed (returncode={names_result.returncode})"]
     errors: list[str] = []
     for raw_name in names_result.stdout.strip().splitlines():
         name = raw_name.strip()
