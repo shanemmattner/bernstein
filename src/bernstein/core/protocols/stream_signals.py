@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 SIGNAL_PREFIX: str = "BERNSTEIN:"
 
 
-class SignalKind(str, Enum):  # noqa: UP042 - explicit str base for wire-token round-trips
+class SignalKind(str, Enum):
     """Canonical signal kinds emitted by adapter stdout.
 
     The string values are the wire tokens that follow the

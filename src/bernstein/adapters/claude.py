@@ -422,9 +422,7 @@ class ClaudeCodeAdapter(CLIAdapter):
                     "rather than emitting an invalid --max-turns flag to the Claude CLI",
                     explicit_max_turns,
                 )
-                raise ValueError(
-                    f"explicit_max_turns must be a positive integer, got {explicit_max_turns}"
-                )
+                raise ValueError(f"explicit_max_turns must be a positive integer, got {explicit_max_turns}")
             max_turns = explicit_max_turns
             _logger.info(
                 "_build_command: max_turns=%d (explicit override; bypassing batch_mode/scope_multiplier computation)",

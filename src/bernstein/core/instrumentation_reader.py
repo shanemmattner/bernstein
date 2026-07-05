@@ -51,7 +51,6 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +68,42 @@ _SQLITE_DB_FILENAME = "run.db"
 # column names exactly. Every returned dict has ALL of these keys, regardless
 # of backend or which fields that backend actually recorded for a given row.
 _LLM_CALL_KEYS = (
-    "call_id", "task_id", "agent_id", "ts_start", "ts_end", "wall_ms",
-    "model", "endpoint", "prompt_tokens", "completion_tokens",
-    "total_tokens", "status", "error",
+    "call_id",
+    "task_id",
+    "agent_id",
+    "ts_start",
+    "ts_end",
+    "wall_ms",
+    "model",
+    "endpoint",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "status",
+    "error",
 )
 _TOOL_CALL_KEYS = (
-    "call_id", "task_id", "agent_id", "ts_start", "ts_end", "wall_ms",
-    "tool", "args", "result", "success", "error",
+    "call_id",
+    "task_id",
+    "agent_id",
+    "ts_start",
+    "ts_end",
+    "wall_ms",
+    "tool",
+    "args",
+    "result",
+    "success",
+    "error",
 )
 _MESSAGE_KEYS = (
-    "id", "idx", "task_id", "agent_id", "role", "content",
-    "content_length", "ts",
+    "id",
+    "idx",
+    "task_id",
+    "agent_id",
+    "role",
+    "content",
+    "content_length",
+    "ts",
 )
 
 
@@ -103,13 +127,16 @@ def _infer_task_agent_ids(agent_dir: Path) -> tuple[str | None, str | None]:
             task_id = None
         logger.debug(
             "instrumentation_reader: inferred task_id=%s agent_id=%s from agent_dir=%s",
-            task_id, agent_id, agent_dir,
+            task_id,
+            agent_id,
+            agent_dir,
         )
         return task_id, agent_id
     except Exception:  # pragma: no cover - defensive, Path attribute access essentially never raises
         logger.warning(
             "instrumentation_reader: failed to infer task_id/agent_id from agent_dir=%s",
-            agent_dir, exc_info=True,
+            agent_dir,
+            exc_info=True,
         )
         return None, None
 
@@ -134,7 +161,8 @@ def detect_format(agent_dir: Path) -> str:
         if db_path.is_file():
             logger.info(
                 "instrumentation_reader.detect_format: found %s -> 'sqlite' (agent_dir=%s)",
-                db_path, agent_dir,
+                db_path,
+                agent_dir,
             )
             return "sqlite"
 
@@ -145,8 +173,7 @@ def detect_format(agent_dir: Path) -> str:
         ]
         if any(p.is_file() for p in jsonl_candidates):
             logger.info(
-                "instrumentation_reader.detect_format: found jsonl file(s) -> 'jsonl' (agent_dir=%s, "
-                "present=%s)",
+                "instrumentation_reader.detect_format: found jsonl file(s) -> 'jsonl' (agent_dir=%s, present=%s)",
                 agent_dir,
                 [p.name for p in jsonl_candidates if p.is_file()],
             )
@@ -159,9 +186,9 @@ def detect_format(agent_dir: Path) -> str:
         return "none"
     except Exception:  # pragma: no cover - defensive, filesystem checks essentially never raise beyond OSError
         logger.warning(
-            "instrumentation_reader.detect_format: unexpected error probing agent_dir=%s, "
-            "returning 'none'",
-            agent_dir, exc_info=True,
+            "instrumentation_reader.detect_format: unexpected error probing agent_dir=%s, returning 'none'",
+            agent_dir,
+            exc_info=True,
         )
         return "none"
 
@@ -173,14 +200,13 @@ def detect_format(agent_dir: Path) -> str:
 
 def _sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
     try:
-        cur = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        )
+        cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
         return cur.fetchone() is not None
     except sqlite3.Error:
         logger.warning(
             "instrumentation_reader: sqlite_master existence check failed for table=%s",
-            table, exc_info=True,
+            table,
+            exc_info=True,
         )
         return False
 
@@ -195,12 +221,15 @@ def _read_sqlite_rows(agent_dir: Path, table: str, columns: tuple[str, ...]) -> 
     db_path = agent_dir / _SQLITE_DB_FILENAME
     logger.debug(
         "instrumentation_reader._read_sqlite_rows: table=%s db_path=%s columns=%s",
-        table, db_path, columns,
+        table,
+        db_path,
+        columns,
     )
     if not db_path.is_file():
         logger.warning(
             "instrumentation_reader._read_sqlite_rows: %s does not exist, returning [] for table=%s",
-            db_path, table,
+            db_path,
+            table,
         )
         return []
 
@@ -208,9 +237,10 @@ def _read_sqlite_rows(agent_dir: Path, table: str, columns: tuple[str, ...]) -> 
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error:
         logger.warning(
-            "instrumentation_reader._read_sqlite_rows: failed to open %s (mode=ro), returning [] "
-            "for table=%s",
-            db_path, table, exc_info=True,
+            "instrumentation_reader._read_sqlite_rows: failed to open %s (mode=ro), returning [] for table=%s",
+            db_path,
+            table,
+            exc_info=True,
         )
         return []
 
@@ -219,7 +249,8 @@ def _read_sqlite_rows(agent_dir: Path, table: str, columns: tuple[str, ...]) -> 
         if not _sqlite_table_exists(conn, table):
             logger.warning(
                 "instrumentation_reader._read_sqlite_rows: table=%s missing in %s, returning []",
-                table, db_path,
+                table,
+                db_path,
             )
             return []
         col_list = ", ".join(columns)
@@ -231,14 +262,19 @@ def _read_sqlite_rows(agent_dir: Path, table: str, columns: tuple[str, ...]) -> 
             logger.warning(
                 "instrumentation_reader._read_sqlite_rows: query failed for table=%s in %s, "
                 "returning whatever rows were read so far (%d)",
-                table, db_path, len(rows_out), exc_info=True,
+                table,
+                db_path,
+                len(rows_out),
+                exc_info=True,
             )
     finally:
         conn.close()
 
     logger.info(
         "instrumentation_reader._read_sqlite_rows: read %d row(s) from table=%s in %s",
-        len(rows_out), table, db_path,
+        len(rows_out),
+        table,
+        db_path,
     )
     return rows_out
 
@@ -285,20 +321,23 @@ def _read_jsonl_lines(path: Path) -> list[dict]:
                     records.append(json.loads(line))
                 except (json.JSONDecodeError, ValueError):
                     logger.warning(
-                        "instrumentation_reader._read_jsonl_lines: failed to parse line %d of %s, "
-                        "skipping that line",
-                        lineno, path, exc_info=True,
+                        "instrumentation_reader._read_jsonl_lines: failed to parse line %d of %s, skipping that line",
+                        lineno,
+                        path,
+                        exc_info=True,
                     )
     except OSError:
         logger.warning(
-            "instrumentation_reader._read_jsonl_lines: failed to open/read %s, returning %d "
-            "record(s) parsed so far",
-            path, len(records), exc_info=True,
+            "instrumentation_reader._read_jsonl_lines: failed to open/read %s, returning %d record(s) parsed so far",
+            path,
+            len(records),
+            exc_info=True,
         )
 
     logger.info(
         "instrumentation_reader._read_jsonl_lines: parsed %d record(s) from %s",
-        len(records), path,
+        len(records),
+        path,
     )
     return records
 
@@ -317,24 +356,27 @@ def _read_jsonl_llm_calls(agent_dir: Path) -> list[dict]:
     raw = _read_jsonl_lines(agent_dir / _JSONL_LLM_CALLS_FILENAME)
     out = []
     for rec in raw:
-        out.append({
-            "call_id": rec.get("call_id"),
-            "task_id": task_id,
-            "agent_id": agent_id,
-            "ts_start": rec.get("ts_start"),
-            "ts_end": rec.get("ts_end"),
-            "wall_ms": rec.get("wall_ms"),
-            "model": rec.get("model"),
-            "endpoint": rec.get("endpoint"),
-            "prompt_tokens": rec.get("prompt_tokens"),
-            "completion_tokens": rec.get("completion_tokens"),
-            "total_tokens": rec.get("total_tokens"),
-            "status": rec.get("status"),
-            "error": rec.get("error"),
-        })
+        out.append(
+            {
+                "call_id": rec.get("call_id"),
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "ts_start": rec.get("ts_start"),
+                "ts_end": rec.get("ts_end"),
+                "wall_ms": rec.get("wall_ms"),
+                "model": rec.get("model"),
+                "endpoint": rec.get("endpoint"),
+                "prompt_tokens": rec.get("prompt_tokens"),
+                "completion_tokens": rec.get("completion_tokens"),
+                "total_tokens": rec.get("total_tokens"),
+                "status": rec.get("status"),
+                "error": rec.get("error"),
+            }
+        )
     logger.debug(
         "instrumentation_reader._read_jsonl_llm_calls: mapped %d record(s) for agent_dir=%s",
-        len(out), agent_dir,
+        len(out),
+        agent_dir,
     )
     return out
 
@@ -363,25 +405,29 @@ def _read_jsonl_tool_calls(agent_dir: Path) -> list[dict]:
                 logger.warning(
                     "instrumentation_reader._read_jsonl_tool_calls: failed to re-serialize args "
                     "for call_id=%s, leaving as None",
-                    rec.get("call_id"), exc_info=True,
+                    rec.get("call_id"),
+                    exc_info=True,
                 )
                 args_val = None
-        out.append({
-            "call_id": rec.get("call_id"),
-            "task_id": task_id,
-            "agent_id": agent_id,
-            "ts_start": rec.get("ts_start"),
-            "ts_end": rec.get("ts_end"),
-            "wall_ms": rec.get("wall_ms"),
-            "tool": rec.get("tool"),
-            "args": args_val,
-            "result": rec.get("result"),
-            "success": rec.get("success"),
-            "error": rec.get("error"),
-        })
+        out.append(
+            {
+                "call_id": rec.get("call_id"),
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "ts_start": rec.get("ts_start"),
+                "ts_end": rec.get("ts_end"),
+                "wall_ms": rec.get("wall_ms"),
+                "tool": rec.get("tool"),
+                "args": args_val,
+                "result": rec.get("result"),
+                "success": rec.get("success"),
+                "error": rec.get("error"),
+            }
+        )
     logger.debug(
         "instrumentation_reader._read_jsonl_tool_calls: mapped %d record(s) for agent_dir=%s",
-        len(out), agent_dir,
+        len(out),
+        agent_dir,
     )
     return out
 
@@ -400,19 +446,22 @@ def _read_jsonl_messages(agent_dir: Path) -> list[dict]:
     raw = _read_jsonl_lines(agent_dir / _JSONL_CONVERSATION_FILENAME)
     out = []
     for rec in raw:
-        out.append({
-            "id": None,
-            "idx": rec.get("idx"),
-            "task_id": task_id,
-            "agent_id": agent_id,
-            "role": rec.get("role"),
-            "content": rec.get("content"),
-            "content_length": rec.get("content_length"),
-            "ts": rec.get("ts"),
-        })
+        out.append(
+            {
+                "id": None,
+                "idx": rec.get("idx"),
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "role": rec.get("role"),
+                "content": rec.get("content"),
+                "content_length": rec.get("content_length"),
+                "ts": rec.get("ts"),
+            }
+        )
     logger.debug(
         "instrumentation_reader._read_jsonl_messages: mapped %d record(s) for agent_dir=%s",
-        len(out), agent_dir,
+        len(out),
+        agent_dir,
     )
     return out
 
@@ -432,7 +481,8 @@ def read_llm_calls(agent_dir: Path) -> list[dict]:
     fmt = detect_format(agent_dir)
     logger.info(
         "instrumentation_reader.read_llm_calls: agent_dir=%s detected format=%s",
-        agent_dir, fmt,
+        agent_dir,
+        fmt,
     )
     if fmt == "sqlite":
         rows = _read_sqlite_llm_calls(agent_dir)
@@ -442,7 +492,9 @@ def read_llm_calls(agent_dir: Path) -> list[dict]:
         rows = []
     logger.info(
         "instrumentation_reader.read_llm_calls: agent_dir=%s format=%s -> %d row(s)",
-        agent_dir, fmt, len(rows),
+        agent_dir,
+        fmt,
+        len(rows),
     )
     return rows
 
@@ -457,7 +509,8 @@ def read_tool_calls(agent_dir: Path) -> list[dict]:
     fmt = detect_format(agent_dir)
     logger.info(
         "instrumentation_reader.read_tool_calls: agent_dir=%s detected format=%s",
-        agent_dir, fmt,
+        agent_dir,
+        fmt,
     )
     if fmt == "sqlite":
         rows = _read_sqlite_tool_calls(agent_dir)
@@ -467,7 +520,9 @@ def read_tool_calls(agent_dir: Path) -> list[dict]:
         rows = []
     logger.info(
         "instrumentation_reader.read_tool_calls: agent_dir=%s format=%s -> %d row(s)",
-        agent_dir, fmt, len(rows),
+        agent_dir,
+        fmt,
+        len(rows),
     )
     return rows
 
@@ -483,7 +538,8 @@ def read_messages(agent_dir: Path) -> list[dict]:
     fmt = detect_format(agent_dir)
     logger.info(
         "instrumentation_reader.read_messages: agent_dir=%s detected format=%s",
-        agent_dir, fmt,
+        agent_dir,
+        fmt,
     )
     if fmt == "sqlite":
         rows = _read_sqlite_messages(agent_dir)
@@ -493,7 +549,9 @@ def read_messages(agent_dir: Path) -> list[dict]:
         rows = []
     logger.info(
         "instrumentation_reader.read_messages: agent_dir=%s format=%s -> %d row(s)",
-        agent_dir, fmt, len(rows),
+        agent_dir,
+        fmt,
+        len(rows),
     )
     return rows
 
@@ -501,6 +559,6 @@ def read_messages(agent_dir: Path) -> list[dict]:
 __all__ = [
     "detect_format",
     "read_llm_calls",
-    "read_tool_calls",
     "read_messages",
+    "read_tool_calls",
 ]

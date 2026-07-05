@@ -139,7 +139,9 @@ def _run_subprocess(
     return result
 
 
-def _run_or_raise(args: list[str], *, timeout: int, cwd: Path | None = None, context: str) -> subprocess.CompletedProcess[str]:
+def _run_or_raise(
+    args: list[str], *, timeout: int, cwd: Path | None = None, context: str
+) -> subprocess.CompletedProcess[str]:
     """Run *args*; raise :class:`DockerRunnerError` with full stderr/stdout on nonzero exit."""
     result = _run_subprocess(args, timeout=timeout, cwd=cwd)
     if result.returncode != 0:
@@ -152,8 +154,7 @@ def _run_or_raise(args: list[str], *, timeout: int, cwd: Path | None = None, con
             result.stderr,
         )
         raise DockerRunnerError(
-            f"{context} failed (returncode={result.returncode}): "
-            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+            f"{context} failed (returncode={result.returncode}): stdout={result.stdout!r} stderr={result.stderr!r}"
         )
     return result
 
@@ -560,8 +561,7 @@ class DockerRunner:
                 result.stderr,
             )
             raise DockerRunnerError(
-                f"docker kill failed for {container_id!r} (returncode={result.returncode}): "
-                f"stderr={result.stderr!r}"
+                f"docker kill failed for {container_id!r} (returncode={result.returncode}): stderr={result.stderr!r}"
             )
         logger.info("Killed container %s (reason=%s)", container_id[:12], reason)
 
@@ -582,8 +582,7 @@ class DockerRunner:
                 result.stderr,
             )
             raise DockerRunnerError(
-                f"docker rm failed for {container_id!r} (returncode={result.returncode}): "
-                f"stderr={result.stderr!r}"
+                f"docker rm failed for {container_id!r} (returncode={result.returncode}): stderr={result.stderr!r}"
             )
         logger.info("Removed container %s", container_id[:12])
 
@@ -673,7 +672,11 @@ class DockerRunner:
             image = detail.get("Config", {}).get("Image", self.image)
             started_at_str = detail.get("State", {}).get("StartedAt", "")
             try:
-                started_at = datetime.fromisoformat(started_at_str.replace("Z", "+00:00")) if started_at_str else datetime.now(UTC)
+                started_at = (
+                    datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+                    if started_at_str
+                    else datetime.now(UTC)
+                )
             except ValueError:
                 started_at = datetime.now(UTC)
 

@@ -95,7 +95,7 @@ def _read_yaml_port_range(seed_path: Path | None) -> tuple[int, int] | None:
         import yaml
 
         data = yaml.safe_load(seed_path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001 - never fail port resolution on a bad seed
+    except Exception as exc:
         logger.debug("port_alloc: could not read %s for port_range: %s", seed_path, exc)
         return None
     if not isinstance(data, dict):
@@ -262,8 +262,10 @@ def resolve_launch_port(
     # --auto-port was requested. If the caller also passed an explicit
     # non-default --port, honour it as a starting preference: try it first,
     # then fall back into the auto-assign range.
-    if requested_port is not None and requested_port != DEFAULT_BERNSTEIN_PORT and is_port_free(
-        requested_port, host=host
+    if (
+        requested_port is not None
+        and requested_port != DEFAULT_BERNSTEIN_PORT
+        and is_port_free(requested_port, host=host)
     ):
         logger.info(
             "resolve_launch_port: auto_port requested but explicit --port %d is free -- using it",

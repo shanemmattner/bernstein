@@ -127,8 +127,7 @@ def compute_max_turns(
         clamped_max_turns = max(min_turns, min(explicit_max_turns, max_turns_cap))
         if clamped_max_turns != explicit_max_turns:
             logger.warning(
-                "max_turns=%s (explicit override clamped to %s; absolute bounds are "
-                "min_turns=%s, max_turns_cap=%s)",
+                "max_turns=%s (explicit override clamped to %s; absolute bounds are min_turns=%s, max_turns_cap=%s)",
                 explicit_max_turns,
                 clamped_max_turns,
                 min_turns,

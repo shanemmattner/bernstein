@@ -968,7 +968,6 @@ def _read_runner_cost_usd(
     return price_result.cost_usd, total_in, total_out
 
 
-
 # Failure types detected via log-pattern scanning that are unambiguous,
 # fatal, and MUST fail/retry the task immediately rather than falling
 # through to the generic "died without output" path (which defers behind
@@ -1063,10 +1062,7 @@ def _handle_failure_detection(
         return True
 
     if _failure_type in _FAST_FAIL_LOG_FAILURE_TYPES:
-        reason = (
-            f"Agent {session.id} died; {_failure_type} detected in agent log "
-            f"(exit_code={session.exit_code!r})"
-        )
+        reason = f"Agent {session.id} died; {_failure_type} detected in agent log (exit_code={session.exit_code!r})"
         try:
             retry_or_fail_task(
                 task_id,

@@ -219,8 +219,7 @@ def _check_python_syntax(cwd: Path) -> list[str]:
         # Fail closed: report it as a blocking error so the merge is
         # refused rather than let a mundane git hiccup pass as clean.
         logger.warning(
-            "Syntax check: STAGED-READ-FAILED cwd=%s returncode=%d stderr=%s -- "
-            "refusing merge as fail-closed",
+            "Syntax check: STAGED-READ-FAILED cwd=%s returncode=%d stderr=%s -- refusing merge as fail-closed",
             cwd,
             names_result.returncode,
             names_result.stderr.strip(),

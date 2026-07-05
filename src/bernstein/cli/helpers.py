@@ -71,6 +71,7 @@ def sdd_pid_watchdog(port: int | None = None) -> str:
     p = port if port is not None else _server_port_from_env()
     return f".sdd/runtime/{p}/watchdog.pid"
 
+
 # Use ASCII-safe banner on Windows to avoid cp1252 encoding issues
 if sys.platform == "win32":
     BANNER = """\
