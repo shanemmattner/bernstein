@@ -2502,6 +2502,15 @@ def _run_verification_gates(
 
     Returns updated (janitor_passed, qg_result) tuple.
     """
+    from bernstein.core.quality.janitor import _NOOP_ROLES
+    role = getattr(task, "role", "")
+    if role in _NOOP_ROLES:
+        logger.info(
+            "Skipping verification gates for noop role=%s task=%s",
+            role, task.id,
+        )
+        return janitor_passed, None
+
     qg_result: Any = None
 
     if janitor_passed:
