@@ -197,3 +197,22 @@ def test_selector_prefer_does_not_reroute_when_candidate_equals_prefer() -> None
         )
         == "sonnet"
     )
+
+
+def test_selector_prefer_iteration_is_deterministic() -> None:
+    # Multiple prefer entries must resolve to the same choice on every call
+    # (sorted alphabetically); frozenset iteration order alone is not stable.
+    hints = _hints_for(
+        "backend", avoid=("opus",), prefer=("sonnet", "haiku", "mistral")
+    )
+    picks = {select_model_with_hints("backend", "opus", hints) for _ in range(50)}
+    assert picks == {"haiku"}
+
+
+def test_selector_skips_prefer_that_is_also_avoided() -> None:
+    # Degenerate producer state: a model landed in both avoid and prefer.
+    # avoid must win — the selector must not return an avoided model.
+    hints = _hints_for(
+        "backend", avoid=("opus", "haiku"), prefer=("haiku", "sonnet")
+    )
+    assert select_model_with_hints("backend", "opus", hints) == "sonnet"
