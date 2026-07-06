@@ -88,6 +88,12 @@ from bernstein.evolution.risk import (
     ProposalRiskScore,
     RiskScorer,
 )
+from bernstein.evolution.routing_hints import (
+    RoleRoutingHints,
+    RoutingHints,
+    load_routing_hints,
+    select_model_with_hints,
+)
 from bernstein.evolution.sandbox import SandboxValidator
 from bernstein.evolution.types import (
     CircuitState,
@@ -150,6 +156,8 @@ __all__ = [
     "QualityMetrics",
     "RiskLevel",
     "RiskScorer",
+    "RoleRoutingHints",
+    "RoutingHints",
     "SandboxResult",
     "SandboxValidator",
     "SuccessRateAdvisor",
@@ -164,6 +172,8 @@ __all__ = [
     "check_proposal_targets",
     "compute_invariants",
     "get_default_coordinator",
+    "load_routing_hints",
+    "select_model_with_hints",
     "verify_invariants",
     "write_lockfile",
 ]
