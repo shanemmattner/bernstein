@@ -485,7 +485,6 @@ class ClaudeCodeAdapter(CLIAdapter):
             "stream-json",
             "--verbose",
             "--include-hook-events",
-            "--no-session-persistence",
         ]
         if claude_session_uuid:
             cmd.extend(["--session-id", claude_session_uuid])
