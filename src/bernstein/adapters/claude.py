@@ -908,7 +908,7 @@ class ClaudeCodeAdapter(CLIAdapter):
         errors_logged = 0
 
         try:
-            transcript_path = self.session_log_path_for(session_id)
+            transcript_path = self.session_log_path_for(session_id, workdir=workdir)
             if transcript_path is None or not transcript_path.exists():
                 _logger.warning(
                     "_instrument_claude_run: no JSONL transcript found for session=%s (session_log_path_for "
@@ -936,12 +936,21 @@ class ClaudeCodeAdapter(CLIAdapter):
                     )
                     transcript_text = ""
 
+            raw_line_count = transcript_text.count("\n") + (1 if transcript_text and not transcript_text.endswith("\n") else 0)
             parser = ClaudeStreamParser()
             events = parser.feed_lines(transcript_text) if transcript_text else []
+            event_type_counts: dict[str, int] = {}
+            for event in events:
+                event_type_counts[event.event_type.value] = event_type_counts.get(event.event_type.value, 0) + 1
             _logger.info(
-                "_instrument_claude_run: parsed %d stream event(s) from transcript for session=%s",
-                len(events),
+                "_instrument_claude_run: session=%s read %d raw JSONL line(s) from transcript_path=%s "
+                "(%d bytes) -> parsed %d event(s), breakdown by type: %s",
                 session_id,
+                raw_line_count,
+                transcript_path,
+                len(transcript_text),
+                len(events),
+                event_type_counts,
             )
 
             pending_tools: dict[str, dict[str, Any]] = {}
@@ -960,6 +969,59 @@ class ClaudeCodeAdapter(CLIAdapter):
                         )
                         msg_idx += 1
                         messages_logged += 1
+
+                    elif event.event_type == StreamEventType.USER_TEXT:
+                        text = str(event.data.get("text", ""))
+                        instrumenter.log_message(
+                            idx=msg_idx,
+                            role="user",
+                            content=text,
+                            content_length=len(text),
+                            ts=now,
+                        )
+                        msg_idx += 1
+                        messages_logged += 1
+                        _logger.debug(
+                            "_instrument_claude_run: session=%s logged user text message (len=%d)",
+                            session_id,
+                            len(text),
+                        )
+
+                    elif event.event_type == StreamEventType.LLM_TURN:
+                        d = event.data
+                        turn_ts = str(d.get("timestamp") or now)
+                        input_tokens = d.get("input_tokens")
+                        output_tokens = d.get("output_tokens")
+                        total_tokens = (
+                            (input_tokens or 0) + (output_tokens or 0)
+                            if input_tokens is not None or output_tokens is not None
+                            else None
+                        )
+                        call_id = str(d.get("request_id") or d.get("uuid") or d.get("message_id") or "") or (
+                            f"claude-turn-{session_id}-{llm_calls_logged}"
+                        )
+                        turn_model = str(d.get("model") or model_id)
+                        instrumenter.log_llm_call(
+                            call_id=call_id,
+                            ts_start=turn_ts,
+                            ts_end=turn_ts,
+                            model=turn_model,
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            status="ok",
+                            error=None,
+                        )
+                        llm_calls_logged += 1
+                        _logger.debug(
+                            "_instrument_claude_run: session=%s logged per-turn llm_call call_id=%s model=%s "
+                            "input_tokens=%s output_tokens=%s",
+                            session_id,
+                            call_id,
+                            turn_model,
+                            input_tokens,
+                            output_tokens,
+                        )
 
                     elif event.event_type == StreamEventType.TOOL_USE_START:
                         tool_id = str(event.data.get("id", ""))
@@ -1317,7 +1379,7 @@ class ClaudeCodeAdapter(CLIAdapter):
         """
         return ["--continue"]
 
-    def session_log_path_for(self, session_id: str) -> Path | None:
+    def session_log_path_for(self, session_id: str, workdir: Path | None = None) -> Path | None:
         """Return the Claude Code JSONL transcript path for this session.
 
         Claude Code writes per-session transcripts under
@@ -1330,6 +1392,22 @@ class ClaudeCodeAdapter(CLIAdapter):
         Args:
             session_id: Bernstein session id. Currently unused for path
                 resolution but accepted for forward compatibility.
+            workdir: The directory the ``claude`` subprocess was actually
+                launched in (``cwd=workdir`` in :meth:`_launch_process`).
+                Bug fix (2026-07-05): this method used to encode
+                ``Path.cwd()`` -- the CALLING process's cwd (the
+                orchestrator's own directory) -- instead of the spawned
+                agent's worktree. Every orchestrated run spawns ``claude``
+                in a per-session worktree under ``.sdd/worktrees/<session>``
+                that never matches the orchestrator's own cwd, so the
+                primary glob almost always missed and this fell through to
+                "newest JSONL across ALL ``~/.claude/projects``" -- i.e. it
+                could grab a transcript belonging to a totally different,
+                unrelated Claude Code session (including this very
+                orchestrating session), which is the root cause of
+                ``_instrument_claude_run`` observing only ~1 message.
+                When ``None`` (back-compat for direct/manual calls with no
+                known workdir), falls back to ``Path.cwd()``.
 
         Returns:
             Absolute path to the latest JSONL transcript, or ``None`` if
@@ -1346,20 +1424,42 @@ class ClaudeCodeAdapter(CLIAdapter):
         # whose encoding the caller does not know.
         projects_dir = home / ".claude" / "projects"
         if not projects_dir.is_dir():
+            _logger.warning("session_log_path_for: projects_dir=%s does not exist", projects_dir)
             return None
-        cwd = Path.cwd().resolve()
+        cwd = (workdir if workdir is not None else Path.cwd()).resolve()
         # Best-effort: match a directory whose name encodes ``cwd``.
         encoded = str(cwd).replace("/", "-")
         candidates = list(projects_dir.glob(f"*{encoded}*/*.jsonl"))
+        _logger.info(
+            "session_log_path_for: resolved cwd=%s (workdir_given=%s) encoded=%s -> %d candidate(s) under %s",
+            cwd,
+            workdir is not None,
+            encoded,
+            len(candidates),
+            projects_dir,
+        )
         if not candidates:
             # Fall back to the newest JSONL across all projects so the
-            # watcher still has a signal even if encoding differs.
+            # watcher still has a signal even if encoding differs. This is
+            # a degraded, best-effort fallback -- it may pick a transcript
+            # from an unrelated session -- logged loudly since it means
+            # per-agent isolation was lost for this run's instrumentation.
             candidates = list(projects_dir.glob("*/*.jsonl"))
+            _logger.warning(
+                "session_log_path_for: no exact match for cwd=%s - falling back to newest JSONL across ALL "
+                "%d project dirs under %s (may pick an UNRELATED session's transcript)",
+                cwd,
+                len(list(projects_dir.iterdir())),
+                projects_dir,
+            )
         if not candidates:
             return None
         try:
-            return max(candidates, key=lambda p: p.stat().st_mtime)
+            resolved = max(candidates, key=lambda p: p.stat().st_mtime)
+            _logger.info("session_log_path_for: resolved transcript path=%s (size=%d bytes)", resolved, resolved.stat().st_size)
+            return resolved
         except OSError:
+            _logger.warning("session_log_path_for: stat() failed while resolving transcript path", exc_info=True)
             return None
 
     def detect_tier(self) -> ApiTierInfo | None:

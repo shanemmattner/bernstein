@@ -36,6 +36,7 @@ _BLOCK_THINKING = "thinking"
 _EVENT_ASSISTANT = "assistant"
 _EVENT_RESULT = "result"
 _EVENT_SYSTEM = "system"
+_EVENT_USER = "user"
 
 
 # Shared cast-type constants to avoid string duplication (Sonar S1192).
@@ -56,6 +57,24 @@ class StreamEventType(StrEnum):
     RESULT = "result"
     ERROR = "error"
     SYSTEM = "system"
+    # bug fix (2026-07-05): real Claude Code JSONL transcripts carry tool
+    # results AND plain user turns inside ``type: "user"`` records (per the
+    # Anthropic messages API convention -- tool results are submitted as a
+    # "user" role turn). The parser previously only matched "assistant",
+    # "result", "system" and silently dropped every "user" line, which is
+    # why _instrument_claude_run only ever captured ~1 message: virtually
+    # all tool_result blocks (and every real user prompt) live under this
+    # event type. USER_TEXT covers user-authored prompt text (either a bare
+    # string ``message.content`` or a ``text`` content block); tool_result
+    # blocks under "user" reuse the existing TOOL_RESULT event type.
+    USER_TEXT = "user_text"
+    # One event per assistant turn (JSONL ``type: "assistant"`` record),
+    # carrying the per-turn model id + token usage Claude Code embeds on
+    # ``message.usage``. Emitted in addition to the per-content-block
+    # events (TEXT/TOOL_USE_START/THINKING) so callers can log one
+    # log_llm_call() per actual model turn instead of a single
+    # end-of-session aggregate.
+    LLM_TURN = "llm_turn"
 
 
 @dataclass(frozen=True)
@@ -213,10 +232,18 @@ class ClaudeStreamParser:
         match event_type:
             case "assistant":
                 events.extend(self._parse_assistant(msg))
+            case "user":
+                events.extend(self._parse_user(msg))
             case "result":
                 events.extend(self._parse_result(msg))
             case "system":
                 events.append(self._parse_system(msg))
+            case _:
+                logger.debug(
+                    "ClaudeStreamParser: unhandled top-level event type=%r - skipping line "
+                    "(recognised types: assistant, user, result, system)",
+                    event_type,
+                )
 
         return events
 
@@ -275,20 +302,29 @@ class ClaudeStreamParser:
         return StreamEvent(event_type=StreamEventType.THINKING, data={"thinking": thinking_text}, raw=msg)
 
     def _parse_assistant(self, msg: dict[str, Any]) -> list[StreamEvent]:
-        """Extract text and tool_use blocks from an assistant message.
+        """Extract the per-turn LLM_TURN event plus text/tool_use blocks.
 
         Args:
             msg: Parsed JSON dict with type="assistant".
 
         Returns:
-            List of events from the content blocks.
+            List of events: one LLM_TURN event (when message-level
+            model/usage metadata is present) followed by one event per
+            content block.
         """
         message_raw = msg.get("message", {})
         if not isinstance(message_raw, dict):
             return []
-        content_raw = cast(_CAST_DICT_STR_ANY, message_raw).get("content", [])
+        message = cast(_CAST_DICT_STR_ANY, message_raw)
+
+        events: list[StreamEvent] = []
+        llm_turn_event = self._handle_llm_turn(message, msg)
+        if llm_turn_event is not None:
+            events.append(llm_turn_event)
+
+        content_raw = message.get("content", [])
         if not isinstance(content_raw, list):
-            return []
+            return events
 
         _BLOCK_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], StreamEvent | None]] = {
             "text": self._handle_text_block,
@@ -297,7 +333,6 @@ class ClaudeStreamParser:
             "thinking": self._handle_thinking_block,
         }
 
-        events: list[StreamEvent] = []
         for block_raw in cast("list[Any]", content_raw):
             if not isinstance(block_raw, dict):
                 continue
@@ -307,6 +342,87 @@ class ClaudeStreamParser:
                 event = handler(block, msg)
                 if event is not None:
                     events.append(event)
+        return events
+
+    def _handle_llm_turn(self, message: dict[str, Any], msg: dict[str, Any]) -> StreamEvent | None:
+        """Build the LLM_TURN event carrying per-turn model + usage metadata.
+
+        Real Claude Code JSONL transcripts embed ``usage`` (token counts)
+        and ``model`` directly on each ``assistant`` message, plus a
+        top-level ``timestamp``/``requestId``/``uuid`` on the enclosing
+        record. Without this, the only per-run LLM-call signal was the
+        single end-of-session ``result`` event -- this event lets callers
+        log one ``log_llm_call()`` per actual model turn.
+
+        Returns ``None`` (rather than a zero-usage event) when the message
+        carries no ``usage`` and no ``model`` -- e.g. hand-built test
+        fixtures that only set ``content`` -- so callers don't log
+        misleading all-``None`` LLM calls for synthetic/partial payloads.
+        """
+        usage_raw = message.get("usage")
+        usage = cast(_CAST_DICT_STR_ANY, usage_raw) if isinstance(usage_raw, dict) else {}
+        model = message.get("model")
+        if not usage and not model:
+            return None
+        data: dict[str, Any] = {
+            "message_id": str(message.get("id", "")),
+            "model": str(model or ""),
+            "request_id": str(msg.get("requestId", "")),
+            "uuid": str(msg.get("uuid", "")),
+            "timestamp": msg.get("timestamp"),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+        }
+        return StreamEvent(event_type=StreamEventType.LLM_TURN, data=data, raw=msg)
+
+    def _parse_user(self, msg: dict[str, Any]) -> list[StreamEvent]:
+        """Extract user turns: tool_result blocks and real user prompt text.
+
+        Real Claude Code transcripts put tool results AND plain user
+        prompts under ``type: "user"``. ``message.content`` may be either
+        a bare string (a simple text-only turn) or a list of content
+        blocks (``tool_result``, ``text``, images, etc). Non-text/
+        non-tool_result block types (e.g. images) are intentionally
+        skipped -- no instrumentation column models them today.
+
+        Args:
+            msg: Parsed JSON dict with type="user".
+
+        Returns:
+            List of events: TOOL_RESULT for tool_result blocks, USER_TEXT
+            for user-authored text (string content or text blocks).
+        """
+        message_raw = msg.get("message", {})
+        if not isinstance(message_raw, dict):
+            return []
+        content_raw = cast(_CAST_DICT_STR_ANY, message_raw).get("content", [])
+
+        events: list[StreamEvent] = []
+
+        if isinstance(content_raw, str):
+            text = content_raw
+            if text:
+                events.append(StreamEvent(event_type=StreamEventType.USER_TEXT, data={"text": text}, raw=msg))
+            return events
+
+        if not isinstance(content_raw, list):
+            return events
+
+        for block_raw in cast("list[Any]", content_raw):
+            if not isinstance(block_raw, dict):
+                continue
+            block = cast(_CAST_DICT_STR_ANY, block_raw)
+            block_type = str(block.get("type", ""))
+            if block_type == "tool_result":
+                events.append(self._handle_tool_result_block(block, msg))
+            elif block_type == "text":
+                text = str(block.get("text", ""))
+                if text:
+                    events.append(StreamEvent(event_type=StreamEventType.USER_TEXT, data={"text": text}, raw=msg))
+            # Other block types (e.g. "image") are intentionally skipped --
+            # no instrumentation column models them today.
         return events
 
     def _parse_result(self, msg: dict[str, Any]) -> list[StreamEvent]:
