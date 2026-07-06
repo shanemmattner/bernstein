@@ -45,7 +45,10 @@ from bernstein.evolution.detector import (
     FailurePattern,
     FailureRecord,
     ImprovementOpportunity,
+    ModelRouteRecommendation,
     OpportunityDetector,
+    SuccessRateAdvisor,
+    SuccessRateAnalysis,
     UpgradeCategory,
 )
 from bernstein.evolution.gate import (
@@ -128,6 +131,7 @@ __all__ = [
     "MetricsAggregator",
     "MetricsCollector",
     "MetricsRecord",
+    "ModelRouteRecommendation",
     "OpportunityDetector",
     "OscillationGuard",
     "OscillationResult",
@@ -148,6 +152,8 @@ __all__ = [
     "RiskScorer",
     "SandboxResult",
     "SandboxValidator",
+    "SuccessRateAdvisor",
+    "SuccessRateAnalysis",
     "TaskMetrics",
     "TrendAnalysis",
     "UpgradeCategory",
@@ -166,10 +172,14 @@ __all__ = [
 class AnalysisEngine:
     """Combines MetricsAggregator + OpportunityDetector into a single analysis pass."""
 
-    def __init__(self, collector: MetricsCollector) -> None:
+    def __init__(
+        self,
+        collector: MetricsCollector,
+        failure_analyzer: FailureAnalyzer | None = None,
+    ) -> None:
         self.collector = collector
         self._aggregator = MetricsAggregator(collector)
-        self._detector = OpportunityDetector(collector)
+        self._detector = OpportunityDetector(collector, failure_analyzer=failure_analyzer)
         self._trends: list[TrendAnalysis] = []
         self._anomalies: list[AnomalyDetection] = []
         self._opportunities: list[ImprovementOpportunity] = []
@@ -247,7 +257,9 @@ class EvolutionCoordinator:
         self.state_dir = state_dir
         self.collector = collector or FileMetricsCollector(state_dir)
         self.executor = executor or FileUpgradeExecutor(state_dir)
-        self.analysis_engine = AnalysisEngine(self.collector)
+        self._failure_analyzer = FailureAnalyzer(state_dir)
+        self._success_rate_advisor = SuccessRateAdvisor(self.collector)
+        self.analysis_engine = AnalysisEngine(self.collector, failure_analyzer=self._failure_analyzer)
         self.analysis_interval_minutes = analysis_interval_minutes
 
         self._last_analysis: float = 0
@@ -313,6 +325,11 @@ class EvolutionCoordinator:
                 self._pending_upgrades.append(emergency_proposal)
 
         self._last_analysis = time.time()
+
+        # Export routing hints so the orchestrator can bias model selection.
+        routing_hints_path = self.state_dir / "evolution" / "routing_hints.json"
+        self._success_rate_advisor.export_routing_hints(routing_hints_path)
+
         return proposals
 
     def _should_auto_approve(self, proposal: UpgradeProposal) -> bool:
@@ -375,11 +392,27 @@ class EvolutionCoordinator:
 
     def get_analysis_summary(self) -> dict[str, Any]:
         """Get a summary of the latest analysis."""
+        sr_analysis = self._success_rate_advisor.analyze()
         return {
             "last_analysis": self._last_analysis,
             "next_analysis_due": self._last_analysis + (self.analysis_interval_minutes * 60),
             "pending_upgrades": len(self._pending_upgrades),
             "applied_upgrades": len(self._applied_upgrades),
+            "success_rate": {
+                "overall": sr_analysis.overall_rate,
+                "total_tasks": sr_analysis.total_tasks,
+                "by_role": sr_analysis.role_rates,
+                "routing_recommendations": [
+                    {
+                        "role": r.role,
+                        "model": r.model,
+                        "recommendation": r.recommendation,
+                        "success_rate": r.success_rate,
+                        "reason": r.reason,
+                    }
+                    for r in sr_analysis.routing_recommendations
+                ],
+            },
             "trends": [
                 {
                     "metric": t.metric_name,
@@ -408,6 +441,10 @@ class EvolutionCoordinator:
         provider: str | None = None,
         tokens_prompt: int = 0,
         tokens_completion: int = 0,
+        files_modified: int = 0,
+        lines_added: int = 0,
+        lines_deleted: int = 0,
+        failure_reason: str = "janitor_failure",
     ) -> None:
         """Record metrics for a completed task.
 
@@ -426,6 +463,11 @@ class EvolutionCoordinator:
             provider: Provider used, if known.
             tokens_prompt: Prompt tokens consumed, if known.
             tokens_completion: Completion tokens consumed, if known.
+            files_modified: Number of files the agent modified.
+            lines_added: Lines added across all modified files.
+            lines_deleted: Lines deleted across all modified files.
+            failure_reason: Short error category for failed tasks, used by
+                the FailureAnalyzer to detect recurring patterns.
         """
         metrics = TaskMetrics(
             timestamp=time.time(),
@@ -438,8 +480,19 @@ class EvolutionCoordinator:
             janitor_passed=janitor_passed,
             tokens_prompt=tokens_prompt,
             tokens_completion=tokens_completion,
+            files_modified=files_modified,
+            lines_added=lines_added,
+            lines_deleted=lines_deleted,
         )
         self.collector.record_task_metrics(metrics)
+
+        if not janitor_passed:
+            self._failure_analyzer.record_failure(
+                task_id=task.id,
+                role=task.role,
+                model=model,
+                error_type=failure_reason,
+            )
 
     def record_agent_lifetime(
         self,
