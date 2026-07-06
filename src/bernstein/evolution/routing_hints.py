@@ -147,10 +147,14 @@ def select_model_with_hints(
 
     1. If ``candidate`` is in the role's ``avoid`` set AND a viable fallback
        exists (a fallback candidate that is not itself in ``avoid``, or any
-       model in ``prefer``), return that alternative.
+       model in ``prefer`` that is not also in ``avoid``), return that
+       alternative. ``prefer`` entries are considered in sorted (alphabetical)
+       order so the choice is deterministic across runs.
     2. Otherwise, return ``candidate`` unchanged — hints are advisory.
 
     A ``prefer`` alternative wins over a merely-not-avoided fallback.
+    A model that appears in both ``prefer`` and ``avoid`` (degenerate config
+    from noisy metrics) is treated as avoided and skipped.
 
     Args:
         role: The task role the model is being chosen for.
@@ -166,9 +170,10 @@ def select_model_with_hints(
     if candidate not in role_hints.avoid:
         return candidate
 
-    for preferred in role_hints.prefer:
-        if preferred != candidate:
-            return preferred
+    for preferred in sorted(role_hints.prefer):
+        if preferred == candidate or preferred in role_hints.avoid:
+            continue
+        return preferred
 
     for alt in fallback_candidates:
         if alt and alt not in role_hints.avoid and alt != candidate:
