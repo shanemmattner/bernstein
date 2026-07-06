@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid as _uuid_mod
 from collections.abc import Mapping  # noqa: TC003 - runtime use in ClassVar annotations
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -394,6 +395,7 @@ class ClaudeCodeAdapter(CLIAdapter):
         task_scope: str = "medium",
         budget_multiplier: float = 1.0,
         explicit_max_turns: int | None = None,
+        claude_session_uuid: str = "",
     ) -> list[str]:
         """Build the claude CLI command with effort mapping.
 
@@ -485,6 +487,8 @@ class ClaudeCodeAdapter(CLIAdapter):
             "--include-hook-events",
             "--no-session-persistence",
         ]
+        if claude_session_uuid:
+            cmd.extend(["--session-id", claude_session_uuid])
         if fallback_model:
             cmd.extend(["--fallback-model", fallback_model])
 
@@ -753,6 +757,7 @@ class ClaudeCodeAdapter(CLIAdapter):
         session_id: str,
         model_id: str,
         spawn_ts: str,
+        claude_session_uuid: str = "",
     ) -> None:
         """Background collector: wait for ``claude_proc`` to exit, then mirror its
         JSONL transcript into a per-agent SQLite ``run.db`` via :mod:`bernstein.core.instrumentation`.
@@ -908,7 +913,7 @@ class ClaudeCodeAdapter(CLIAdapter):
         errors_logged = 0
 
         try:
-            transcript_path = self.session_log_path_for(session_id, workdir=workdir)
+            transcript_path = self.session_log_path_for(session_id, workdir=workdir, claude_session_uuid=claude_session_uuid)
             if transcript_path is None or not transcript_path.exists():
                 _logger.warning(
                     "_instrument_claude_run: no JSONL transcript found for session=%s (session_log_path_for "
@@ -1158,6 +1163,10 @@ class ClaudeCodeAdapter(CLIAdapter):
         # covers the whole session, not just the post-exit instrumentation
         # window.
         spawn_ts = _now_iso_for_instrumentation()
+        # Deterministic session UUID passed to the Claude CLI via
+        # --session-id so session_log_path_for() can locate the exact
+        # transcript file instead of guessing via mtime heuristics.
+        claude_session_uuid = str(_uuid_mod.uuid4())
         # Issue #1797: encode any attached images into the prompt body
         # as base64 with the correct MIME type so the upstream model API
         # sees them. The Claude Code CLI does not accept attachments
@@ -1218,6 +1227,7 @@ class ClaudeCodeAdapter(CLIAdapter):
             task_scope=task_scope,
             budget_multiplier=budget_multiplier,
             explicit_max_turns=explicit_max_turns,
+            claude_session_uuid=claude_session_uuid,
         )
 
         # Wrap with bernstein-worker for process visibility
@@ -1315,6 +1325,7 @@ class ClaudeCodeAdapter(CLIAdapter):
                     "session_id": session_id,
                     "model_id": model_id,
                     "spawn_ts": spawn_ts,
+                    "claude_session_uuid": claude_session_uuid,
                 },
                 name=f"claude-instrumentation-{session_id}",
                 daemon=True,
@@ -1379,84 +1390,102 @@ class ClaudeCodeAdapter(CLIAdapter):
         """
         return ["--continue"]
 
-    def session_log_path_for(self, session_id: str, workdir: Path | None = None) -> Path | None:
+    def session_log_path_for(
+        self, session_id: str, workdir: Path | None = None, claude_session_uuid: str = ""
+    ) -> Path | None:
         """Return the Claude Code JSONL transcript path for this session.
 
         Claude Code writes per-session transcripts under
         ``~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl``. The
         ``<session-uuid>`` is assigned by Claude itself and is not the
-        Bernstein ``session_id``, so we return the most recently modified
-        JSONL under the encoded-cwd directory that matches the worktree
-        the agent is running in.
+        Bernstein ``session_id`` -- unless ``claude_session_uuid`` is
+        supplied, in which case ``spawn()`` passed that same UUID to the
+        Claude CLI via ``--session-id``, making the transcript filename
+        deterministic.
 
         Args:
             session_id: Bernstein session id. Currently unused for path
                 resolution but accepted for forward compatibility.
             workdir: The directory the ``claude`` subprocess was actually
                 launched in (``cwd=workdir`` in :meth:`_launch_process`).
-                Bug fix (2026-07-05): this method used to encode
-                ``Path.cwd()`` -- the CALLING process's cwd (the
-                orchestrator's own directory) -- instead of the spawned
-                agent's worktree. Every orchestrated run spawns ``claude``
-                in a per-session worktree under ``.sdd/worktrees/<session>``
-                that never matches the orchestrator's own cwd, so the
-                primary glob almost always missed and this fell through to
-                "newest JSONL across ALL ``~/.claude/projects``" -- i.e. it
-                could grab a transcript belonging to a totally different,
-                unrelated Claude Code session (including this very
-                orchestrating session), which is the root cause of
-                ``_instrument_claude_run`` observing only ~1 message.
                 When ``None`` (back-compat for direct/manual calls with no
                 known workdir), falls back to ``Path.cwd()``.
+            claude_session_uuid: The UUID passed to the Claude CLI via
+                ``--session-id`` at spawn time. When present, this method
+                looks for the EXACT file ``<claude_session_uuid>.jsonl``
+                and returns ``None`` if it isn't found -- no mtime
+                guessing. When empty (legacy/back-compat callers), falls
+                back to a cwd-scoped mtime heuristic that does NOT search
+                outside the matched project directory, to avoid grabbing
+                an unrelated session's transcript.
 
         Returns:
-            Absolute path to the latest JSONL transcript, or ``None`` if
-            the projects directory or any transcript file is missing.
+            Absolute path to the resolved JSONL transcript, or ``None`` if
+            it cannot be found.
         """
         del session_id
         try:
             home = Path.home()
         except (OSError, RuntimeError):
             return None
-        # Claude encodes the current working directory by replacing path
-        # separators with dashes. We accept any subdirectory under
-        # ``~/.claude/projects/`` because the spawn cwd may be a worktree
-        # whose encoding the caller does not know.
         projects_dir = home / ".claude" / "projects"
         if not projects_dir.is_dir():
             _logger.warning("session_log_path_for: projects_dir=%s does not exist", projects_dir)
             return None
         cwd = (workdir if workdir is not None else Path.cwd()).resolve()
-        # Best-effort: match a directory whose name encodes ``cwd``.
         encoded = str(cwd).replace("/", "-")
+
+        # Deterministic path when we know the Claude session UUID
+        if claude_session_uuid:
+            # Find the exact project directory
+            matching_dirs = list(projects_dir.glob(f"*{encoded}*"))
+            if not matching_dirs:
+                _logger.warning(
+                    "session_log_path_for: no project dir matching encoded=%s under %s",
+                    encoded,
+                    projects_dir,
+                )
+                return None
+            for proj_dir in matching_dirs:
+                candidate = proj_dir / f"{claude_session_uuid}.jsonl"
+                if candidate.exists():
+                    _logger.info(
+                        "session_log_path_for: deterministic match uuid=%s path=%s (size=%d bytes)",
+                        claude_session_uuid,
+                        candidate,
+                        candidate.stat().st_size,
+                    )
+                    return candidate
+            _logger.warning(
+                "session_log_path_for: UUID %s not found in any of %d project dirs matching encoded=%s - "
+                "transcript may not have been written yet or claude used a different session id",
+                claude_session_uuid,
+                len(matching_dirs),
+                encoded,
+            )
+            return None
+
+        # Legacy fallback: no UUID available, use mtime heuristic (degraded)
         candidates = list(projects_dir.glob(f"*{encoded}*/*.jsonl"))
         _logger.info(
-            "session_log_path_for: resolved cwd=%s (workdir_given=%s) encoded=%s -> %d candidate(s) under %s",
+            "session_log_path_for: no claude_session_uuid - falling back to mtime heuristic, "
+            "resolved cwd=%s encoded=%s -> %d candidate(s)",
             cwd,
-            workdir is not None,
             encoded,
             len(candidates),
-            projects_dir,
         )
         if not candidates:
-            # Fall back to the newest JSONL across all projects so the
-            # watcher still has a signal even if encoding differs. This is
-            # a degraded, best-effort fallback -- it may pick a transcript
-            # from an unrelated session -- logged loudly since it means
-            # per-agent isolation was lost for this run's instrumentation.
-            candidates = list(projects_dir.glob("*/*.jsonl"))
             _logger.warning(
-                "session_log_path_for: no exact match for cwd=%s - falling back to newest JSONL across ALL "
-                "%d project dirs under %s (may pick an UNRELATED session's transcript)",
+                "session_log_path_for: no JSONL files found for cwd=%s - returning None "
+                "(NOT falling back to all projects to avoid stale data contamination)",
                 cwd,
-                len(list(projects_dir.iterdir())),
-                projects_dir,
             )
-        if not candidates:
             return None
         try:
             resolved = max(candidates, key=lambda p: p.stat().st_mtime)
-            _logger.info("session_log_path_for: resolved transcript path=%s (size=%d bytes)", resolved, resolved.stat().st_size)
+            _logger.info(
+                "session_log_path_for: resolved transcript path=%s (size=%d bytes)", resolved, resolved.stat().st_size
+            )
             return resolved
         except OSError:
             _logger.warning("session_log_path_for: stat() failed while resolving transcript path", exc_info=True)
