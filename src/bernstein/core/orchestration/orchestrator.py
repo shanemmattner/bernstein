@@ -528,6 +528,24 @@ class Orchestrator:
             logger.info("Exported BERNSTEIN_RUN_ID=%s for spawned-agent instrumentation", run_id)
         except Exception as exc:  # intentional-broad-except: defensive, must never block startup
             logger.warning("Failed to export BERNSTEIN_RUN_ID=%s to process env: %s", run_id, exc)
+        # Bug fix: ``bernstein.adapters.claude.ClaudeCodeAdapter._instrument_claude_run``
+        # runs as a background thread inside THIS process (not the spawned
+        # ``claude`` CLI subprocess) and needs the persistent project root
+        # -- not a per-session worktree -- to anchor run.db so it survives
+        # worktree cleanup/merge. This ``workdir`` is the orchestrator's own
+        # project root (see ``Orchestrator(workdir=Path.cwd())`` call sites
+        # in the CLI), the same root wave-2's ``write_summary_json`` already
+        # writes ``.sdd/runs/<run_id>/...`` under. Exported the same direct-
+        # os.environ way as ``BERNSTEIN_RUN_ID`` above so any in-process
+        # reader (this process only) can pick it up without extra plumbing.
+        try:
+            os.environ["BERNSTEIN_PROJECT_ROOT"] = str(workdir)
+            logger.info(
+                "Exported BERNSTEIN_PROJECT_ROOT=%s for persistent run.db resolution (survives worktree cleanup)",
+                workdir,
+            )
+        except Exception as exc:  # intentional-broad-except: defensive, must never block startup
+            logger.warning("Failed to export BERNSTEIN_PROJECT_ROOT=%s to process env: %s", workdir, exc)
         hard_budget_usd = 0.0
         _raw_hard = os.environ.get("BERNSTEIN_HARD_BUDGET_USD", "").strip()
         if _raw_hard:

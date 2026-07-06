@@ -822,14 +822,60 @@ class ClaudeCodeAdapter(CLIAdapter):
         # agent_id here instead of naming a higher-level task grouping.
         task_id = session_id
         agent_id = session_id
-        base_dir = resolve_agent_dir(workdir, run_id, task_id, agent_id)
+
+        # Bug fix: under default worktree isolation, ``workdir`` here is a
+        # per-session git worktree (e.g. ``.sdd/worktrees/<session>/``) that
+        # ``WorktreeManager`` deletes on cleanup/merge -- writing run.db under
+        # ``workdir/.sdd/runs/...`` means it is destroyed the moment the
+        # worktree is torn down, even for a fully successful run. This exactly
+        # mirrors the ``heartbeat_dir``/``instrumentation_root`` bug already
+        # fixed for the OpenAI Agents runner (see
+        # ``bernstein.core.agents.spawner_core._mcp_config_for_adapter`` and
+        # ``bernstein.adapters.openai_agents_runner.run``) -- but that fix
+        # plumbs the project root through ``mcp_config``, which for THIS
+        # adapter is serialized verbatim into the on-disk ``--mcp-config``
+        # JSON handed to the Claude CLI (see ``spawn()`` above), so injecting
+        # extra sibling keys there would corrupt the real MCP server config.
+        # Instead, this method runs as a background thread inside the SAME
+        # orchestrator process that set ``BERNSTEIN_RUN_ID`` directly on
+        # ``os.environ`` (see ``Orchestrator.__init__``) -- so we read a
+        # sibling ``BERNSTEIN_PROJECT_ROOT`` env var the same way, set by the
+        # orchestrator to its own persistent ``workdir`` (the project root,
+        # never a worktree). That directory is exactly where wave-2's
+        # ``write_summary_json`` already writes ``.sdd/runs/<run_id>/...``,
+        # so anchoring run.db there keeps both waves' data in the same place
+        # and survives worktree cleanup.
+        project_root_env = os.environ.get("BERNSTEIN_PROJECT_ROOT")
+        if project_root_env:
+            instrumentation_base = Path(project_root_env)
+            _logger.info(
+                "_instrument_claude_run: BERNSTEIN_PROJECT_ROOT=%s found in env for session=%s - anchoring "
+                "run.db there instead of worktree workdir=%s so it survives worktree cleanup",
+                instrumentation_base,
+                session_id,
+                workdir,
+            )
+        else:
+            instrumentation_base = workdir
+            _logger.warning(
+                "_instrument_claude_run: BERNSTEIN_PROJECT_ROOT not set in env for session=%s - falling back "
+                "to worktree workdir=%s for run.db. If this session is running inside a worktree that gets "
+                "cleaned up/merged, run.db WILL BE LOST. This fallback exists for hand-invocation/tests with "
+                "no orchestrator; a real orchestrated run should always have BERNSTEIN_PROJECT_ROOT set.",
+                session_id,
+                workdir,
+            )
+
+        base_dir = resolve_agent_dir(instrumentation_base, run_id, task_id, agent_id)
         _logger.info(
             "_instrument_claude_run: starting instrumentation for session=%s run_id=%s task_id=%s "
-            "agent_id=%s base_dir=%s",
+            "agent_id=%s instrumentation_base=%s (worktree workdir=%s) base_dir=%s",
             session_id,
             run_id,
             task_id,
             agent_id,
+            instrumentation_base,
+            workdir,
             base_dir,
         )
 
