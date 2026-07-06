@@ -126,7 +126,7 @@ def test_worktree_setup_config_application(repo_root: Path) -> None:
             return GitResult(0, "", "")
 
         mock_add.side_effect = mock_add_side_effect
-        mock_run.return_value = MagicMock(returncode=0)
+        mock_run.return_value = MagicMock(returncode=0, stdout="deadbeef1234\n", stderr="")
 
         path = manager.create(session_id)
 
