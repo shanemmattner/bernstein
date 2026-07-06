@@ -10,9 +10,9 @@ role_model_policy:
   manager: {model: opus, effort: max}
   architect: {model: opus, effort: max}
   security: {model: sonnet, effort: high}
-  backend: {model: sonnet, effort: high}
+  backend: {model: opus, effort: high}
   frontend: {model: sonnet, effort: high}
-  qa: {model: sonnet, effort: high}
+  qa: {model: opus, effort: high}
   reviewer: {model: sonnet, effort: high}
   docs: {model: sonnet, effort: high}
   devops: {model: sonnet, effort: high}
