@@ -93,6 +93,9 @@ class WorktreeSetupConfig:
     setup_command: str | None = None
 
 
+_BERNSTEIN_META_DIR = ".bernstein"
+_WORKTREE_BASE_SHA_FILE = "worktree_base_sha"
+
 _STALE_LOCK_AGE_S = 300  # 5 minutes - locks older than this are considered stale
 
 
@@ -222,6 +225,65 @@ def _apply_sparse_checkout(worktree_path: Path, sparse_paths: Sequence[str]) -> 
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         logger.warning("Sparse checkout failed for %s: %s", worktree_path, exc)
         return False
+
+
+def _capture_worktree_base_sha(repo_root: Path, worktree_path: Path) -> str | None:
+    """Record the commit the worktree's branch was cut from (BUG-fix: rule
+    enforcer scoping).
+
+    ``git worktree add <path> -b <branch>`` with no explicit start-point
+    branches from ``repo_root``'s current ``HEAD`` at creation time. Resolving
+    that SHA *after* the worktree exists and writing it into the worktree
+    itself lets downstream consumers (notably
+    :func:`bernstein.core.security.rule_enforcer._get_git_diff`) diff only the
+    commits the agent actually made in this worktree, instead of every commit
+    on the branch since ``main`` (which, on a long-lived fork branch, can be
+    hundreds of pre-existing commits the agent never touched).
+
+    Best-effort: on any failure this logs a warning and returns ``None`` -
+    the rule enforcer falls back to ``git diff main..HEAD`` in that case, so
+    a failed capture never blocks worktree creation.
+
+    Args:
+        repo_root: Repository root the worktree was cut from.
+        worktree_path: Path to the newly-created worktree.
+
+    Returns:
+        The captured base SHA, or ``None`` if it could not be resolved/written.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Could not resolve base SHA for worktree %s: %s", worktree_path, exc)
+        return None
+
+    if result.returncode != 0 or not result.stdout.strip():
+        logger.warning(
+            "git rev-parse HEAD failed while capturing worktree base SHA for %s: %s",
+            worktree_path,
+            result.stderr.strip(),
+        )
+        return None
+
+    base_sha = result.stdout.strip()
+    meta_dir = worktree_path / _BERNSTEIN_META_DIR
+    try:
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        (meta_dir / _WORKTREE_BASE_SHA_FILE).write_text(base_sha + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not write worktree base SHA marker for %s: %s", worktree_path, exc)
+        return None
+
+    logger.info("Captured worktree base SHA %s for %s (marker: %s)", base_sha[:12], worktree_path, meta_dir / _WORKTREE_BASE_SHA_FILE)
+    return base_sha
 
 
 def _symlink_dirs(repo_root: Path, worktree_path: Path, dirs: list[str]) -> None:
@@ -761,6 +823,11 @@ class WorktreeManager:
             raise WorktreeError(f"git worktree add failed for session '{session_id}': {stderr}")
 
         logger.info("Created worktree %s (branch %s)", worktree_path, branch_name)
+
+        # Capture the commit this worktree's branch was cut from, so the rule
+        # enforcer can scope its diff to just this agent's commits instead of
+        # every pre-existing commit on the branch since main.
+        _capture_worktree_base_sha(self.repo_root, worktree_path)
 
         # Write lock file for stale detection (T487)
         worker_pid = os.getpid()

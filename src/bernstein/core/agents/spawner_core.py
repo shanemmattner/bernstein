@@ -3225,6 +3225,7 @@ class AgentSpawner:
             tasks=tasks,
             session_id=session_id,
             templates_dir=self._templates_dir,
+            server_url=self._server_url,
         )
         _inject_scheduled_tasks(
             workdir=spawn_cwd,

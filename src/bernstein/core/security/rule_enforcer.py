@@ -16,11 +16,10 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from bernstein.core.models import Task
 
 logger = logging.getLogger(__name__)
@@ -201,18 +200,79 @@ def load_rules_config(workdir: Path) -> RulesConfig | None:
 # ---------------------------------------------------------------------------
 
 
-def _get_git_diff(run_dir: Path) -> str:
-    """Return committed changes relative to ``main``.
+_WORKTREE_BASE_SHA_MARKER = Path(".bernstein") / "worktree_base_sha"
 
-    Uses ``git diff main..HEAD`` so that already-committed agent changes
-    are visible.  Falls back to ``git diff HEAD~1..HEAD`` when ``main``
-    is not available (e.g. detached-HEAD CI builds), and finally to an
-    empty string on any error.
+
+def _read_worktree_base_sha(run_dir: Path) -> str | None:
+    """Read the base SHA marker written by :mod:`bernstein.core.git.worktree`.
+
+    The marker (``<run_dir>/.bernstein/worktree_base_sha``) records the
+    commit an agent's worktree branch was cut from. Reading it here lets
+    ``_get_git_diff`` scope the diff to just that agent's own commits,
+    instead of every commit on the branch since ``main`` (BUG-fix: on a fork
+    branch that is 200+ commits ahead of main, ``main..HEAD`` swept in
+    pre-existing violations no agent in the current run introduced).
+
+    Returns:
+        The SHA string if the marker exists and looks like a valid SHA,
+        else ``None`` (no marker, empty file, or unreadable).
     """
-    for diff_cmd in (
-        ["git", "diff", "main..HEAD"],
-        ["git", "diff", "HEAD~1..HEAD"],
-    ):
+    marker_path = run_dir / _WORKTREE_BASE_SHA_MARKER
+    if not marker_path.is_file():
+        return None
+    try:
+        sha = marker_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.debug("Could not read worktree base SHA marker %s: %s", marker_path, exc)
+        return None
+    if not sha or not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
+        logger.debug("Worktree base SHA marker %s has invalid content: %r", marker_path, sha)
+        return None
+    return sha
+
+
+def _get_git_diff(run_dir: Path, base_ref: str | None = None) -> str:
+    """Return committed changes relative to a base ref.
+
+    Diff strategy, in priority order (logged so the choice is auditable):
+
+    1. *base_ref*, if explicitly given by the caller.
+    2. The ``.bernstein/worktree_base_sha`` marker under *run_dir*, written
+       at worktree-creation time - this scopes the diff to just the current
+       agent's own commits in its worktree.
+    3. ``git diff main..HEAD`` (original/legacy behavior, preserved exactly
+       for callers with no worktree marker, e.g. the main workdir).
+    4. ``git diff HEAD~1..HEAD`` when ``main`` is not available (e.g.
+       detached-HEAD CI builds).
+
+    Falls back to an empty string on any error.
+    """
+    resolved_ref = base_ref
+    strategy = "explicit base_ref"
+    if resolved_ref is None:
+        resolved_ref = _read_worktree_base_sha(run_dir)
+        strategy = "worktree_base_sha marker"
+
+    diff_cmds: list[list[str]]
+    if resolved_ref is not None:
+        logger.info(
+            "_get_git_diff for %s: using %s (%s..HEAD)",
+            run_dir,
+            strategy,
+            resolved_ref[:12],
+        )
+        diff_cmds = [["git", "diff", f"{resolved_ref}..HEAD"]]
+    else:
+        logger.info(
+            "_get_git_diff for %s: no base_ref/marker found, falling back to main..HEAD",
+            run_dir,
+        )
+        diff_cmds = [
+            ["git", "diff", "main..HEAD"],
+            ["git", "diff", "HEAD~1..HEAD"],
+        ]
+
+    for diff_cmd in diff_cmds:
         try:
             result = subprocess.run(
                 diff_cmd,
@@ -225,7 +285,15 @@ def _get_git_diff(run_dir: Path) -> str:
             )
             if result.returncode == 0 and result.stdout:
                 return result.stdout
-        except (subprocess.TimeoutExpired, OSError):
+            if result.returncode != 0:
+                logger.debug(
+                    "_get_git_diff command %s exited %d: %s",
+                    diff_cmd,
+                    result.returncode,
+                    result.stderr.strip()[:300],
+                )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.debug("_get_git_diff command %s failed: %s", diff_cmd, exc)
             continue
     return ""
 
@@ -431,6 +499,7 @@ def run_rule_enforcement(
     run_dir: Path,
     workdir: Path,
     config: RulesConfig,
+    base_ref: str | None = None,
 ) -> RuleEnforcerResult:
     """Run all organizational rules on a completed task's changes.
 
@@ -444,6 +513,11 @@ def run_rule_enforcement(
         run_dir: Directory for command checks (agent worktree or workdir).
         workdir: Project root for file-existence checks and metrics.
         config: Loaded :class:`RulesConfig`.
+        base_ref: Optional explicit git ref/SHA to diff against instead of
+            ``main``. When omitted, ``_get_git_diff`` falls back to the
+            ``.bernstein/worktree_base_sha`` marker under *run_dir* (see
+            :mod:`bernstein.core.git.worktree`), and only then to the legacy
+            ``main..HEAD`` behavior.
 
     Returns:
         :class:`RuleEnforcerResult` with per-rule violations and overall flag.
@@ -451,7 +525,7 @@ def run_rule_enforcement(
     if not config.enabled or not config.rules:
         return RuleEnforcerResult(task_id=task.id, passed=True)
 
-    diff = _get_git_diff(run_dir)
+    diff = _get_git_diff(run_dir, base_ref=base_ref)
     violations: list[RuleViolation] = []
 
     for rule in config.rules:
