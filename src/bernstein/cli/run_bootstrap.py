@@ -8,6 +8,7 @@ import datetime
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from contextlib import suppress
@@ -1042,6 +1043,13 @@ def exec_restart() -> None:
     help="Show scheduling plan without executing: which agent/model/tier each task would be assigned to.",
 )
 @click.option(
+    "--fresh",
+    "fresh",
+    is_flag=True,
+    default=False,
+    help="Purge all stale .sdd state (cache, runs, worktrees, metrics) before starting.",
+)
+@click.option(
     "--idle",
     is_flag=True,
     default=False,
@@ -1254,6 +1262,7 @@ def run(
     allow_paid: bool = False,
     ab_test: bool = False,
     dry_run: bool = False,
+    fresh: bool = False,
     idle: bool = False,
     cprofile: bool = False,
     run_profile: str | None = None,
@@ -1306,6 +1315,7 @@ def run(
             allow_paid=allow_paid,
             ab_test=ab_test,
             dry_run=dry_run,
+            fresh=fresh,
             idle=idle,
             cprofile=cprofile,
             run_profile=run_profile,
@@ -1358,6 +1368,7 @@ def _run_impl(
     allow_paid: bool,
     ab_test: bool,
     dry_run: bool,
+    fresh: bool = False,
     idle: bool,
     cprofile: bool,
     run_profile: str | None,
@@ -1557,10 +1568,27 @@ def _run_impl(
             "BERNSTEIN_MOCK_IDLE_MIN_S..MAX_S seconds (default 15-120). Zero LLM spend."
         )
 
+    workdir = Path.cwd()
+
+    # --fresh: purge stale .sdd state before anything else touches it. This
+    # runs unconditionally when requested, regardless of --dry-run/
+    # --plan-only, since purging stale cache/state shouldn't be gated on
+    # whether the run actually executes.
+    if fresh:
+        sdd_dir = workdir / ".sdd"
+        logger.info("--fresh: purging stale state from %s", sdd_dir)
+        shutil.rmtree(sdd_dir / "caching", ignore_errors=True)
+        (sdd_dir / "runtime" / "tasks.jsonl").unlink(missing_ok=True)
+        (sdd_dir / "archive" / "tasks.jsonl").unlink(missing_ok=True)
+        shutil.rmtree(sdd_dir / "runs", ignore_errors=True)
+        shutil.rmtree(sdd_dir / "runtime", ignore_errors=True)
+        shutil.rmtree(sdd_dir / "worktrees", ignore_errors=True)
+        shutil.rmtree(sdd_dir / "metrics", ignore_errors=True)
+
     # --dry-run: show scheduling plan without executing
     if dry_run:
         _show_dry_run_plan(
-            workdir=Path.cwd(),
+            workdir=workdir,
             plan_file=plan_file,
             goal=goal,
             seed_file=seed_file,
@@ -1568,8 +1596,6 @@ def _run_impl(
             cli=cli,
         )
         return
-
-    workdir = Path.cwd()
 
     # --auto-port: resolve the actual port to bind to BEFORE anything else
     # touches .sdd/runtime/ -- everything downstream (server, spawner,

@@ -834,6 +834,7 @@ def cli(
         audit=False,
         ab_test=False,
         dry_run=False,
+        fresh=force_fresh,
         cprofile=False,
         run_profile=None,
         allow_network=(),
