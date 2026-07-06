@@ -87,6 +87,10 @@ from bernstein.core.context import TaskContextBuilder
 from bernstein.core.context_recommendations import RecommendationEngine
 from bernstein.core.defaults import SPAWN
 from bernstein.core.lessons import gather_lessons_for_context
+from bernstein.evolution.routing_hints import (
+    load_routing_hints,
+    select_model_with_hints,
+)
 from bernstein.core.lifecycle import transition_agent
 from bernstein.core.models import (
     AbortReason,
@@ -196,6 +200,70 @@ def _list_subdirs_cached(path: Path) -> list[str]:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_routing_hints(
+    *,
+    workdir: Path,
+    role: str,
+    current_model: str,
+    role_model_policy: dict[str, dict[str, Any]],
+    hints_relpath: tuple[str, ...] = (".sdd", "evolution", "routing_hints.json"),
+    max_age_seconds: float = 24 * 3600.0,
+) -> str:
+    """Return a possibly-swapped model biased by SuccessRateAdvisor hints.
+
+    Loads ``<workdir>/.sdd/evolution/routing_hints.json`` (produced by
+    :class:`bernstein.evolution.detector.SuccessRateAdvisor`) and asks
+    :func:`bernstein.evolution.routing_hints.select_model_with_hints` to
+    pick a safer alternative when the current model is on the role's
+    "avoid" list. If no hints file exists, the file is stale, or no
+    alternative is preferable, ``current_model`` is returned unchanged.
+
+    Fallback candidates:
+      * Claude tier model ("opus"/"sonnet"/"haiku") -> the other two
+        tier models, letting the advisor swap e.g. "opus" -> "sonnet"
+        without changing the adapter.
+      * Any other model -> ``role_model_policy["default"]["model"]``
+        when set, keeping the swap inside the adapter's model family.
+
+    Advisory only: this helper never picks a model outside the caller's
+    fallback set, never modifies provider/effort/max_tokens, and never
+    raises (caller wraps in a try/except as a defence-in-depth).
+    """
+    hints_path = workdir.joinpath(*hints_relpath)
+    hints = load_routing_hints(hints_path, max_age_seconds=max_age_seconds)
+    if hints.is_empty:
+        return current_model
+
+    if current_model in _CLAUDE_TIER_MODELS:
+        fallback_candidates: tuple[str, ...] = tuple(
+            m for m in ("sonnet", "haiku", "opus") if m != current_model
+        )
+    else:
+        default_policy_model = role_model_policy.get("default", {}).get("model")
+        fallback_candidates = (
+            (default_policy_model,) if isinstance(default_policy_model, str) and default_policy_model else ()
+        )
+
+    biased = select_model_with_hints(
+        role,
+        current_model,
+        hints,
+        fallback_candidates=fallback_candidates,
+    )
+    if biased != current_model:
+        role_hints = hints.for_role(role)
+        logger.info(
+            "routing_hints: swapping model for role=%s: %r -> %r "
+            "(avoid=%s, prefer=%s)",
+            role,
+            current_model,
+            biased,
+            sorted(role_hints.avoid),
+            sorted(role_hints.prefer),
+        )
+    return biased
 
 
 def _sanitise_for_log(value: str) -> str:
@@ -2875,6 +2943,31 @@ class AgentSpawner:
                 role_policy.get("provider"),
                 role_policy.get("model"),
             )
+
+        # Success-rate advisory routing: see ``_apply_routing_hints`` for
+        # the biasing rules and guardrails.
+        try:
+            if (
+                not task_model_is_pinned
+                and not role_policy.get("model")
+                and not model_override
+            ):
+                biased_model = _apply_routing_hints(
+                    workdir=self._workdir,
+                    role=role_name,
+                    current_model=model_config.model,
+                    role_model_policy=self._role_model_policy,
+                )
+                if biased_model != model_config.model:
+                    model_config = ModelConfig(
+                        model=biased_model,
+                        effort=model_config.effort,
+                        max_tokens=model_config.max_tokens,
+                        is_batch=model_config.is_batch,
+                    )
+                    routing_source = f"{routing_source}+routing_hints"
+        except Exception:  # never let advisory routing crash the spawn path
+            logger.exception("routing_hints application failed; keeping model unchanged")
 
         logger.info(
             "Model selection for role=%s: model=%s effort=%s provider=%s source=%s "
