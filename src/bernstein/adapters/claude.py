@@ -20,6 +20,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping  # noqa: TC003 - runtime use in ClassVar annotations
 from pathlib import Path
@@ -27,6 +28,7 @@ from typing import Any, ClassVar, cast
 
 from bernstein.adapters.base import DEFAULT_TIMEOUT_SECONDS, CLIAdapter, SpawnResult, build_worker_cmd
 from bernstein.adapters.claude_agents import build_agents_json
+from bernstein.adapters.claude_stream_parser import ClaudeStreamParser, StreamEventType
 
 # Re-export helpers that were inlined here before split them
 # into sibling modules.  Callers and tests import these names directly
@@ -49,6 +51,7 @@ from bernstein.adapters.env_isolation import (
     record_embedded_teams_opt_in,
 )
 from bernstein.core.defaults import COST
+from bernstein.core.instrumentation import get_instrumenter, init_instrumenter, resolve_agent_dir
 from bernstein.core.models import ApiTier, ApiTierInfo, ModelConfig, ProviderType, RateLimit
 from bernstein.core.platform_compat import kill_process_group_graceful, process_alive
 
@@ -247,6 +250,19 @@ _CAST_DICT_STR_ANY = "dict[str, Any]"
 
 
 _logger = logging.getLogger(__name__)
+
+
+def _now_iso_for_instrumentation() -> str:
+    """Local import-free ISO timestamp helper (mirrors instrumentation._now_iso).
+
+    Kept as a tiny local helper -- same pattern as
+    :func:`bernstein.adapters.openai_agents_runner._now_iso_for_instrumentation`
+    -- rather than importing a private helper from
+    :mod:`bernstein.core.instrumentation`.
+    """
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.UTC).isoformat(timespec="milliseconds")
 
 
 # How long a cached rate-limit probe result stays valid (seconds).
@@ -729,6 +745,290 @@ class ClaudeCodeAdapter(CLIAdapter):
         except OSError:
             _logger.debug("Failed to write hooks config to %s", settings_path)
 
+    def _instrument_claude_run(
+        self,
+        *,
+        claude_proc: subprocess.Popen[bytes],
+        workdir: Path,
+        session_id: str,
+        model_id: str,
+        spawn_ts: str,
+    ) -> None:
+        """Background collector: wait for ``claude_proc`` to exit, then mirror its
+        JSONL transcript into a per-agent SQLite ``run.db`` via :mod:`bernstein.core.instrumentation`.
+
+        Runs in a daemon thread started from :meth:`spawn` -- unlike
+        :mod:`bernstein.adapters.openai_agents_runner` (an in-process SDK
+        runner that can hook ``on_llm_start``/``on_llm_end`` directly), the
+        Claude Code CLI is an external subprocess: the only place this
+        adapter can observe its activity is the JSONL transcript Claude
+        itself writes to ``~/.claude/projects/<encoded-cwd>/<uuid>.jsonl``
+        (see :meth:`session_log_path_for`), which is only complete once the
+        process has exited. This method owns that entire post-exit
+        lifecycle: init -> parse -> log -> close.
+
+        This is strictly additive, observe-only instrumentation (matching
+        the contract documented in :mod:`bernstein.core.instrumentation`'s
+        module docstring): every step is wrapped in its own try/except and
+        any failure is logged with full traceback, never raised, so a bug
+        here can NEVER affect the agent run's own result -- by the time
+        this thread runs, ``spawn()`` has already returned the
+        ``SpawnResult`` to the caller.
+
+        Args:
+            claude_proc: The ``claude`` subprocess (already launched).
+            workdir: Project working directory this session ran in.
+            session_id: Bernstein session id (used as both ``task_id`` and
+                ``agent_id`` -- see the ``task_id`` note below).
+            model_id: Resolved Claude model id (e.g. ``claude-sonnet-4-6``),
+                used as the ``model`` field on the aggregate llm_call row.
+            spawn_ts: ISO-8601 timestamp captured at spawn time, used as
+                ``ts_start`` for the aggregate llm_call row.
+        """
+        try:
+            _logger.debug(
+                "_instrument_claude_run: waiting for claude_proc pid=%s (session=%s) to exit before "
+                "instrumentation can start (transcript is only complete post-exit)",
+                claude_proc.pid,
+                session_id,
+            )
+            claude_proc.wait()
+        except Exception:
+            _logger.warning(
+                "_instrument_claude_run: claude_proc.wait() failed for session=%s pid=%s - "
+                "instrumentation for this run will be skipped",
+                session_id,
+                claude_proc.pid,
+                exc_info=True,
+            )
+            return
+
+        run_id = os.environ.get("BERNSTEIN_RUN_ID")
+        if not run_id:
+            _logger.info(
+                "_instrument_claude_run: BERNSTEIN_RUN_ID not set in env for session=%s - falling back to "
+                "'unknown' (this run's instrumentation will be bucketed under the literal 'unknown' run_id)",
+                session_id,
+            )
+            run_id = "unknown"
+
+        # ClaudeCodeAdapter.spawn() has no separate task_id parameter (unlike
+        # the OpenAI Agents runner's RunnerManifest.task_id) -- session_id is
+        # the only identifier this adapter is given. Using it for BOTH
+        # task_id and agent_id is a deliberate, documented simplification:
+        # every claude.py-spawned run gets its own instrumentation directory
+        # keyed by session_id either way, so no records are lost or merged
+        # across sessions; it just means run.db's task_id column duplicates
+        # agent_id here instead of naming a higher-level task grouping.
+        task_id = session_id
+        agent_id = session_id
+        base_dir = resolve_agent_dir(workdir, run_id, task_id, agent_id)
+        _logger.info(
+            "_instrument_claude_run: starting instrumentation for session=%s run_id=%s task_id=%s "
+            "agent_id=%s base_dir=%s",
+            session_id,
+            run_id,
+            task_id,
+            agent_id,
+            base_dir,
+        )
+
+        try:
+            instrumenter = init_instrumenter(run_id=run_id, task_id=task_id, agent_id=agent_id, base_dir=base_dir)
+            # Sanity-check the singleton actually installed: get_instrumenter()
+            # should now return the SAME instance we just created. A mismatch
+            # here would mean a concurrent process in this interpreter
+            # re-initialized the singleton before we could use it - surfacing
+            # that as a debug log beats silently writing to the wrong backend.
+            if get_instrumenter() is not instrumenter:
+                _logger.warning(
+                    "_instrument_claude_run: get_instrumenter() singleton does not match the instance "
+                    "init_instrumenter() just returned for session=%s - another init_instrumenter() call "
+                    "raced this one; continuing with the instance THIS thread created",
+                    session_id,
+                )
+        except Exception:
+            _logger.warning(
+                "_instrument_claude_run: init_instrumenter raised for session=%s - instrumentation "
+                "for this run is disabled, the agent run itself already completed successfully",
+                session_id,
+                exc_info=True,
+            )
+            return
+
+        llm_calls_logged = 0
+        tool_calls_logged = 0
+        messages_logged = 0
+        errors_logged = 0
+
+        try:
+            transcript_path = self.session_log_path_for(session_id)
+            if transcript_path is None or not transcript_path.exists():
+                _logger.warning(
+                    "_instrument_claude_run: no JSONL transcript found for session=%s (session_log_path_for "
+                    "returned %s) - instrumentation will produce an EMPTY run.db for this session "
+                    "(run.db is still created so the file's existence is a reliable signal)",
+                    session_id,
+                    transcript_path,
+                )
+                transcript_text = ""
+            else:
+                try:
+                    transcript_text = transcript_path.read_text(encoding="utf-8", errors="replace")
+                    _logger.debug(
+                        "_instrument_claude_run: read transcript %s (%d bytes) for session=%s",
+                        transcript_path,
+                        len(transcript_text),
+                        session_id,
+                    )
+                except OSError:
+                    _logger.warning(
+                        "_instrument_claude_run: failed to read transcript %s for session=%s",
+                        transcript_path,
+                        session_id,
+                        exc_info=True,
+                    )
+                    transcript_text = ""
+
+            parser = ClaudeStreamParser()
+            events = parser.feed_lines(transcript_text) if transcript_text else []
+            _logger.info(
+                "_instrument_claude_run: parsed %d stream event(s) from transcript for session=%s",
+                len(events),
+                session_id,
+            )
+
+            pending_tools: dict[str, dict[str, Any]] = {}
+            msg_idx = 0
+            for event in events:
+                now = _now_iso_for_instrumentation()
+                try:
+                    if event.event_type == StreamEventType.TEXT:
+                        text = str(event.data.get("text", ""))
+                        instrumenter.log_message(
+                            idx=msg_idx,
+                            role="assistant",
+                            content=text,
+                            content_length=len(text),
+                            ts=now,
+                        )
+                        msg_idx += 1
+                        messages_logged += 1
+
+                    elif event.event_type == StreamEventType.TOOL_USE_START:
+                        tool_id = str(event.data.get("id", ""))
+                        pending_tools[tool_id] = {
+                            "name": event.data.get("name", "unknown"),
+                            "input_preview": event.data.get("input_preview", ""),
+                            "ts_start": now,
+                        }
+                        _logger.debug(
+                            "_instrument_claude_run: session=%s tool_use_start id=%s name=%s",
+                            session_id,
+                            tool_id,
+                            event.data.get("name"),
+                        )
+
+                    elif event.event_type == StreamEventType.TOOL_RESULT:
+                        tool_use_id = str(event.data.get("tool_use_id", ""))
+                        pending = pending_tools.pop(tool_use_id, None)
+                        tool_name = pending["name"] if pending else "unknown"
+                        ts_start = pending["ts_start"] if pending else now
+                        args = {"input_preview": pending["input_preview"]} if pending else {}
+                        is_error = bool(event.data.get("is_error", False))
+                        instrumenter.log_tool_call(
+                            call_id=tool_use_id or f"tc-{tool_calls_logged}",
+                            ts_start=ts_start,
+                            ts_end=now,
+                            tool=str(tool_name),
+                            args=args,
+                            success=not is_error,
+                            error=str(event.data.get("content_preview", "")) if is_error else None,
+                            result=event.data.get("content_preview"),
+                        )
+                        tool_calls_logged += 1
+
+                    elif event.event_type == StreamEventType.RESULT:
+                        is_error = bool(event.data.get("is_error", False))
+                        instrumenter.log_llm_call(
+                            call_id=f"claude-session-{session_id}",
+                            ts_start=spawn_ts,
+                            ts_end=now,
+                            model=model_id,
+                            status="error" if is_error else "ok",
+                            error=str(event.data.get("result", "")) if is_error else None,
+                        )
+                        llm_calls_logged += 1
+                        _logger.debug(
+                            "_instrument_claude_run: session=%s logged aggregate llm_call from result "
+                            "event (num_turns=%s duration_ms=%s total_cost_usd=%s is_error=%s)",
+                            session_id,
+                            event.data.get("num_turns"),
+                            event.data.get("duration_ms"),
+                            event.data.get("total_cost_usd"),
+                            is_error,
+                        )
+
+                    elif event.event_type == StreamEventType.ERROR:
+                        message = str(event.data.get("message", ""))
+                        instrumenter.log_message(
+                            idx=msg_idx,
+                            role="system",
+                            content=message,
+                            content_length=len(message),
+                            ts=now,
+                        )
+                        msg_idx += 1
+                        messages_logged += 1
+                        errors_logged += 1
+
+                    # THINKING / SYSTEM events are intentionally not mirrored
+                    # into run.db today - no column/table models them yet.
+                except Exception:
+                    _logger.warning(
+                        "_instrument_claude_run: failed to log event_type=%s for session=%s - skipping "
+                        "this event and continuing with the rest of the transcript",
+                        event.event_type,
+                        session_id,
+                        exc_info=True,
+                    )
+
+            if pending_tools:
+                _logger.debug(
+                    "_instrument_claude_run: session=%s ended with %d tool_use block(s) that never "
+                    "received a matching tool_result event: %s",
+                    session_id,
+                    len(pending_tools),
+                    list(pending_tools.keys()),
+                )
+
+            _logger.info(
+                "_instrument_claude_run: session=%s instrumentation complete - llm_calls=%d "
+                "tool_calls=%d messages=%d (of which %d were error events) written to %s",
+                session_id,
+                llm_calls_logged,
+                tool_calls_logged,
+                messages_logged,
+                errors_logged,
+                base_dir / "run.db",
+            )
+        except Exception:
+            _logger.warning(
+                "_instrument_claude_run: unhandled error instrumenting session=%s - partial "
+                "instrumentation may have been written before the failure; the agent run itself "
+                "already completed and is unaffected",
+                session_id,
+                exc_info=True,
+            )
+        finally:
+            try:
+                instrumenter.close()
+                _logger.debug("_instrument_claude_run: closed instrumenter for session=%s", session_id)
+            except Exception:
+                _logger.warning(
+                    "_instrument_claude_run: instrumenter.close() failed for session=%s", session_id, exc_info=True
+                )
+
     def spawn(
         self,
         *,
@@ -745,6 +1045,11 @@ class ClaudeCodeAdapter(CLIAdapter):
         explicit_max_turns: int | None = None,
     ) -> SpawnResult:
         self.enforce_network_policy()
+        # Captured before any subprocess work so the eventual aggregate
+        # llm_call row (see _instrument_claude_run) has a ts_start that
+        # covers the whole session, not just the post-exit instrumentation
+        # window.
+        spawn_ts = _now_iso_for_instrumentation()
         # Issue #1797: encode any attached images into the prompt body
         # as base64 with the correct MIME type so the upstream model API
         # sees them. The Claude Code CLI does not accept attachments
@@ -884,6 +1189,42 @@ class ClaudeCodeAdapter(CLIAdapter):
             with contextlib.suppress(Exception):
                 wrapper_proc.wait(timeout=1)
             raise
+
+        # Wire SQLite instrumentation (Wave 3) into this subprocess-based
+        # adapter. Unlike the in-process OpenAI Agents runner, there is no
+        # hook point inside the claude subprocess itself - the collector
+        # runs in a daemon background thread that blocks on claude_proc.wait()
+        # and only starts parsing once the JSONL transcript is complete (see
+        # _instrument_claude_run docstring). Started here (post fast-exit-probe)
+        # rather than earlier so a process that fails within the probe window
+        # never gets an instrumentation thread waiting on it.
+        try:
+            instrumentation_thread = threading.Thread(
+                target=self._instrument_claude_run,
+                kwargs={
+                    "claude_proc": claude_proc,
+                    "workdir": workdir,
+                    "session_id": session_id,
+                    "model_id": model_id,
+                    "spawn_ts": spawn_ts,
+                },
+                name=f"claude-instrumentation-{session_id}",
+                daemon=True,
+            )
+            instrumentation_thread.start()
+            _logger.debug(
+                "spawn: started instrumentation collector thread %r for session=%s pid=%s",
+                instrumentation_thread.name,
+                session_id,
+                claude_proc.pid,
+            )
+        except Exception:
+            _logger.warning(
+                "spawn: failed to start instrumentation collector thread for session=%s - this run "
+                "will have NO run.db; the agent process itself is unaffected and continues normally",
+                session_id,
+                exc_info=True,
+            )
 
         result = SpawnResult(pid=claude_proc.pid, log_path=log_path, proc=claude_proc)
         if timeout_seconds > 0:
