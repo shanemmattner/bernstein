@@ -1432,7 +1432,12 @@ class ClaudeCodeAdapter(CLIAdapter):
             _logger.warning("session_log_path_for: projects_dir=%s does not exist", projects_dir)
             return None
         cwd = (workdir if workdir is not None else Path.cwd()).resolve()
-        encoded = str(cwd).replace("/", "-")
+        # Claude Code's own project-dir encoding replaces BOTH "/" and "."
+        # with "-" (not stripping dots): "/foo/.sdd/bar" -> "-foo--sdd-bar".
+        # Verified against 8 real ~/.claude/projects/ dir names for this
+        # repo's .sdd worktrees, e.g.
+        # "...bernstein-fork--sdd-worktrees-backend-de9c3d91" (exact match).
+        encoded = str(cwd).replace("/", "-").replace(".", "-")
 
         # Deterministic path when we know the Claude session UUID
         if claude_session_uuid:
